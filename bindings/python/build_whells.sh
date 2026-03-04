@@ -9,7 +9,7 @@ rustup target add aarch64-unknown-linux-musl
 rustup target add aarch64-pc-windows-msvc
 rustup target add x86_64-pc-windows-msvc
 
-output_dir="dist_py"
+output_dir="dist"
 rm -rf "$output_dir"
 py_versions=("3.8" "3.9" "3.10" "3.11" "3.12" "3.13" "3.13t" "3.14" "3.14t")
 targets_mac=("x86_64-apple-darwin" "aarch64-apple-darwin")
