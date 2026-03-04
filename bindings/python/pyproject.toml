@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "amqp-rs"
 description = "Python AMQP Client Library developed in Rust using PyO3."
-version = "0.1.0.post2"
+version = "0.1.1"
 requires-python = ">=3.8"
 license = "Apache-2.0"
 license-files = ['LICENSE']
@@ -48,6 +48,9 @@ Repository = "https://github.com/berrytern/amqp-rs"
 "Bug Tracker" = "https://github.com/berrytern/amqp-rs/issues"
 Source = "https://github.com/berrytern/amqp-rs"
 
+
+#[tool.maturin]
+#manifest-path = "bindings/python/Cargo.toml"
 
 [dependency-groups]
 dev = [

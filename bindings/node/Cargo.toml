@@ -1,0 +1,30 @@
+
+[package]
+authors = ["João Pedro Miranda C. Hluchan <berrytern@gmail.com>"]
+edition = "2024"
+name = "amqp_rs"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# Link to your local core crate!
+amqp-rs-core = { path = "../../core" }
+
+# Python-specific dependencies
+amqp-client-rust = { version = "=0.0.3-alpha.18", features = ["tls", "zstd", "lz4_flex", "flate2"] }
+napi = { version = "3.0.0", features = ["napi4", "async", "tokio_rt"] }
+napi-derive = "3.0.0"
+
+
+
+[build-dependencies]
+napi-build = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
