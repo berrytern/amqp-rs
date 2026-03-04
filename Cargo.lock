@@ -30,9 +30,9 @@ dependencies = [
 
 [[package]]
 name = "amqp-client-rust"
-version = "0.0.4"
+version = "0.0.7-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aa3ebee8f948e5e8111fa25f799365866ab2f0fd96156916e8dd0aab443c85c"
+checksum = "aa10d8790643dd811970261f32928f8fcb204da92fcbea6305b2ac3cb292556a"
 dependencies = [
  "amqprs",
  "arc-swap",
@@ -50,9 +50,9 @@ dependencies = [
 
 [[package]]
 name = "amqp-rs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
- "amqp-client-rust 0.0.4",
+ "amqp-client-rust 0.0.7-alpha.3",
  "amqp-rs-core",
  "pyo3",
  "pyo3-async-runtimes",
