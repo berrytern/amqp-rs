@@ -42,7 +42,7 @@ wheels = [
 
 [[package]]
 name = "amqp-rs"
-version = "0.1.0.post2"
+version = "0.1.1"
 source = { editable = "." }
 
 [package.dev-dependencies]
