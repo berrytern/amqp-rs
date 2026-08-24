@@ -1,24 +1,19 @@
-use std::{sync::Arc};
-use amqp_client_rust::{
-    amqprs::tls::{TlsAdaptor as RuTlsAdaptor}, api::{
-        eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
-        utils::{ContentEncoding as RuContentEncoding, DeliveryMode as RuDeliveryMode, Message as RuMessage},
-    }, domain::config::{
-        Config as RuConfig, ConfigOptions as RuConfigOptions, QoSConfig as RuQoSConfig,
-    }
+use amqp_client_rust::api::{
+    eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ, utils::Message as RuMessage,
 };
-use pyo3::{
-    exceptions::PyValueError, prelude::*, types::{PyBytes, PyString}
-};
-pub mod exceptions;
+use pyo3::{prelude::*, types::PyBytes};
+use std::sync::Arc;
 pub mod api;
+pub mod exceptions;
 pub mod utils;
 use exceptions::AppError;
-use std::path::PathBuf;
 
 use crate::{
     api::connection::AsyncConnection,
-    utils::{Config, ConfigOptions, ContentEncoding, DeliveryMode, Message, Payload, QoSConfig, TlsAdaptor}
+    utils::{
+        Config, ConfigOptions, ContentEncoding, DeliveryMode, Message, Payload,
+        PublishConfirmations, QoSConfig, QueueOptions, TlsAdaptor,
+    },
 };
 
 /*static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
@@ -88,7 +83,7 @@ impl AsyncEventbus {
                 .await
             {
                 Ok(res) => Ok(res),
-                Err(e) => return Err(AppError::from(e).into()),
+                Err(e) => Err(AppError::from(e).into()),
             }
         })
     }
@@ -119,7 +114,7 @@ impl AsyncEventbus {
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
-            let response = match eventbus
+            match eventbus
                 .rpc_client(
                     &exchange_name,
                     &routing_key,
@@ -135,8 +130,7 @@ impl AsyncEventbus {
             {
                 Ok(res) => Ok(res),
                 Err(e) => Err(AppError::from(e).into()),
-            };
-            response
+            }
         })
     }
 
@@ -169,12 +163,25 @@ impl AsyncEventbus {
                         let locals_clone = locals.clone();
                         async move {
                             pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                let future_result = Python::attach(|py| -> PyResult<_> {
+                                let future_result = match Python::try_attach(|py| -> PyResult<_> {
                                     let bound_handler = handler_clone.bind(py);
                                     let coro = bound_handler.call1((Message::from(body),))?;
 
-                                    pyo3_async_runtimes::tokio::into_future(coro)
-                                });
+                                    match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
+                                        Ok(fut) => Ok(fut),
+                                        Err(e) => {
+                                            if let Ok(close_fn) =
+                                                coro.getattr(pyo3::intern!(py, "close"))
+                                            {
+                                                let _ = close_fn.call0();
+                                            }
+                                            Err(e)
+                                        }
+                                    }
+                                }) {
+                                    Some(res) => res,
+                                    None => return Ok(()),
+                                };
                                 match future_result {
                                     Ok(py_future) => match py_future.await {
                                         Ok(_) => Ok(()),
@@ -231,29 +238,63 @@ impl AsyncEventbus {
                         let locals_clone = locals.clone();
                         async move {
                             pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                let py_future_result = Python::attach(|py| -> PyResult<_> {
-                                    let bound_handler = handler_clone.bind(py);
-                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                let py_future_result =
+                                    match Python::try_attach(|py| -> PyResult<_> {
+                                        let bound_handler = handler_clone.bind(py);
+                                        let coro = bound_handler.call1((Message::from(body),))?;
 
-                                    // Now into_future will successfully find the asyncio loop!
-                                    pyo3_async_runtimes::tokio::into_future(coro)
-                                });
+                                        // Now into_future will successfully find the asyncio loop!
+                                        match pyo3_async_runtimes::tokio::into_future(coro.clone())
+                                        {
+                                            Ok(fut) => Ok(fut),
+                                            Err(e) => {
+                                                if let Ok(close_fn) =
+                                                    coro.getattr(pyo3::intern!(py, "close"))
+                                                {
+                                                    let _ = close_fn.call0();
+                                                }
+                                                Err(e)
+                                            }
+                                        }
+                                    }) {
+                                        Some(res) => res,
+                                        None => {
+                                            return Err(Box::new(std::io::Error::new(
+                                                std::io::ErrorKind::Other,
+                                                "Python runtime is finalizing or unavailable",
+                                            ))
+                                                as Box<dyn std::error::Error + Send + Sync>);
+                                        }
+                                    };
                                 match py_future_result {
                                     Ok(py_future) => match py_future.await {
                                         Ok(result) => {
-                                            Python::attach(|py| {
+                                            match Python::try_attach(|py| {
                                                 if let Ok(message) = result.extract::<Message>(py) {
                                                     return Ok(RuMessage::from(message));
                                                 }
-                                            match result.cast_bound::<PyBytes>(py) {
-                                                Ok(bytes) => Ok( RuMessage { body: bytes.as_bytes().into(), content_type: None }),
-                                                Err(_) => Err(Box::new(std::io::Error::new(
-                                                    std::io::ErrorKind::InvalidData,
-                                                    "RPC handler must return bytes",
+                                                match result.cast_bound::<PyBytes>(py) {
+                                                    Ok(bytes) => Ok(RuMessage {
+                                                        body: bytes.as_bytes().into(),
+                                                        content_type: None,
+                                                    }),
+                                                    Err(_) => Err(Box::new(std::io::Error::new(
+                                                        std::io::ErrorKind::InvalidData,
+                                                        "RPC handler must return bytes",
+                                                    ))
+                                                        as Box<
+                                                            dyn std::error::Error + Send + Sync,
+                                                        >),
+                                                }
+                                            }) {
+                                                Some(res) => res,
+                                                None => Err(Box::new(std::io::Error::new(
+                                                    std::io::ErrorKind::Other,
+                                                    "Python runtime is finalizing or unavailable",
                                                 ))
                                                     as Box<dyn std::error::Error + Send + Sync>),
                                             }
-                                        })},
+                                        }
                                         Err(e) => Err(Box::new(std::io::Error::new(
                                             std::io::ErrorKind::Other,
                                             e.to_string(),
@@ -285,14 +326,23 @@ impl AsyncEventbus {
         let py = slf.py();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            eventbus.dispose().await.map_err(|_| {
-                AppError {
-                    description: None,
-                    message: None,
-                    error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
-                }
-                .into()
+            tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current()
+                    .block_on(async move { eventbus.dispose().await.map_err(|e| e.to_string()) })
             })
+            .await
+            .map_err(|e| AppError {
+                description: Some(e.to_string()),
+                message: None,
+                error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
+            })?
+            .map_err(|_| AppError {
+                description: None,
+                message: None,
+                error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
+            })?;
+
+            Ok(())
         })
     }
 }
@@ -307,5 +357,8 @@ fn amqp_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TlsAdaptor>()?;
     m.add_class::<ContentEncoding>()?;
     m.add_class::<Message>()?;
+    m.add_class::<DeliveryMode>()?;
+    m.add_class::<QueueOptions>()?;
+    m.add_class::<PublishConfirmations>()?;
     Ok(())
 }

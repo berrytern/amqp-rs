@@ -1,8 +1,7 @@
-use std::fmt::{self, Display};
-use pyo3::{PyErr};
-use pyo3::exceptions::{PyException};
 use amqp_client_rust::errors::{AppError as RuAppError, AppErrorType};
-
+use pyo3::PyErr;
+use pyo3::exceptions::PyException;
+use std::fmt::{self, Display};
 
 impl From<RuAppError> for AppError {
     fn from(error: RuAppError) -> Self {

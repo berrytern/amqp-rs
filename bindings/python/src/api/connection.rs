@@ -1,24 +1,15 @@
+use crate::{
+    exceptions::AppError,
+    utils::{
+        Config, ContentEncoding, DeliveryMode, Message, Payload, PublishConfirmations, QueueOptions,
+    },
+};
+use amqp_client_rust::api::{
+    connection::AsyncConnection as RuAsyncConnection,
+    utils::{Message as RuMessage, QueueOptions as RuQueueOptions},
+};
+use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::{pin::Pin, sync::Arc};
-use amqp_client_rust::{
-    amqprs::tls::{TlsAdaptor as RuTlsAdaptor}, 
-    api::{
-        eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
-        connection::AsyncConnection as RuAsyncConnection,
-        utils::{
-            ContentEncoding as RuContentEncoding,
-            DeliveryMode as RuDeliveryMode,
-            Message as RuMessage,
-            Confirmations as RuPublishConfirmation,
-            QueueOptions as RuQueueOptions
-        },
-    }, domain::config::{
-        Config as RuConfig, ConfigOptions as RuConfigOptions, QoSConfig as RuQoSConfig,
-    }
-};
-use crate::{exceptions::AppError, utils::{Config, ContentEncoding, DeliveryMode, Message, Payload, PublishConfirmations, QueueOptions}};
-use pyo3::{
-    exceptions::PyValueError, prelude::*, types::PyBytes
-};
 
 #[pyclass(skip_from_py_object)]
 pub struct AsyncConnection {
@@ -28,11 +19,21 @@ pub struct AsyncConnection {
 #[pymethods]
 impl AsyncConnection {
     #[new]
-    pub fn new(config: Config, publish_confirmations: PublishConfirmations, auto_ack: bool, prefetch_count: Option<u16>) -> PyResult<Self> {
+    pub fn new(
+        config: Config,
+        publish_confirmations: PublishConfirmations,
+        auto_ack: bool,
+        prefetch_count: Option<u16>,
+    ) -> PyResult<Self> {
         let rt = pyo3_async_runtimes::tokio::get_runtime();
 
         let _guard = rt.enter();
-        let connection = RuAsyncConnection::new(Arc::new(config.into()), publish_confirmations.into(), auto_ack, prefetch_count);
+        let connection = RuAsyncConnection::new(
+            Arc::new(config.into()),
+            publish_confirmations.into(),
+            auto_ack,
+            prefetch_count,
+        );
         Ok(Self {
             inner: Arc::new(connection),
         })
@@ -63,9 +64,19 @@ impl AsyncConnection {
         let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            conn.publish(&exchange_name, &routing_key, payload_bytes, &content_type, content_encoding.into(), command_timeout, delivery_mode.into(), expiration).await.map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
+            conn.publish(
+                &exchange_name,
+                &routing_key,
+                payload_bytes,
+                &content_type,
+                content_encoding.into(),
+                command_timeout,
+                delivery_mode.into(),
+                expiration,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
         })
-        
     }
 
     pub fn subscribe<'py>(
@@ -79,7 +90,6 @@ impl AsyncConnection {
         command_timeout: Option<u64>,
         queue_options: QueueOptions,
     ) -> PyResult<Bound<'py, PyAny>> {
-
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
         let conn = Arc::clone(&slf.inner);
@@ -96,12 +106,23 @@ impl AsyncConnection {
             let locals_clone = locals.clone();
             async move {
                 pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                    let future_result = Python::attach(|py| -> PyResult<_> {
+                    let future_result = match Python::try_attach(|py| -> PyResult<_> {
                         let bound_handler = handler_clone.bind(py);
                         let coro = bound_handler.call1((Message::from(body),))?;
 
-                        pyo3_async_runtimes::tokio::into_future(coro)
-                    });
+                        match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
+                            Ok(fut) => Ok(fut),
+                            Err(e) => {
+                                if let Ok(close_fn) = coro.getattr(pyo3::intern!(py, "close")) {
+                                    let _ = close_fn.call0();
+                                }
+                                Err(e)
+                            }
+                        }
+                    }) {
+                        Some(res) => res,
+                        None => return Ok(()),
+                    };
                     match future_result {
                         Ok(py_future) => match py_future.await {
                             Ok(_) => Ok(()),
@@ -122,11 +143,16 @@ impl AsyncConnection {
             }
         };
         let handler = Arc::new(move |data| {
-            Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>>
+            Box::pin(handler(data))
+                as Pin<
+                    Box<
+                        dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>>
+                            + Send,
+                    >,
+                >
         });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-
             match conn
                 .subscribe(
                     handler,
@@ -144,7 +170,6 @@ impl AsyncConnection {
                 Err(e) => Err(AppError::from(e).into()),
             }
         })
-        
     }
 
     pub fn rpc_server<'py>(
@@ -174,29 +199,57 @@ impl AsyncConnection {
             let locals_clone = locals.clone();
             async move {
                 pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                    let py_future_result = Python::attach(|py| -> PyResult<_> {
+                    let py_future_result = match Python::try_attach(|py| -> PyResult<_> {
                         let bound_handler = handler_clone.bind(py);
                         let coro = bound_handler.call1((Message::from(body),))?;
 
                         // Now into_future will successfully find the asyncio loop!
-                        pyo3_async_runtimes::tokio::into_future(coro)
-                    });
+                        match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
+                            Ok(fut) => Ok(fut),
+                            Err(e) => {
+                                if let Ok(close_fn) = coro.getattr(pyo3::intern!(py, "close")) {
+                                    let _ = close_fn.call0();
+                                }
+                                Err(e)
+                            }
+                        }
+                    }) {
+                        Some(res) => res,
+                        None => {
+                            return Err(Box::new(std::io::Error::new(
+                                std::io::ErrorKind::Other,
+                                "Python runtime is finalizing or unavailable",
+                            ))
+                                as Box<dyn std::error::Error + Send + Sync>);
+                        }
+                    };
                     match py_future_result {
                         Ok(py_future) => match py_future.await {
                             Ok(result) => {
-                                Python::attach(|py| {
+                                match Python::try_attach(|py| {
                                     if let Ok(message) = result.extract::<Message>(py) {
                                         return Ok(RuMessage::from(message));
                                     }
-                                match result.cast_bound::<PyBytes>(py) {
-                                    Ok(bytes) => Ok( RuMessage { body: bytes.as_bytes().into(), content_type: None }),
-                                    Err(_) => Err(Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::InvalidData,
-                                        "RPC handler must return bytes",
+                                    match result.cast_bound::<PyBytes>(py) {
+                                        Ok(bytes) => Ok(RuMessage {
+                                            body: bytes.as_bytes().into(),
+                                            content_type: None,
+                                        }),
+                                        Err(_) => Err(Box::new(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidData,
+                                            "RPC handler must return bytes",
+                                        ))
+                                            as Box<dyn std::error::Error + Send + Sync>),
+                                    }
+                                }) {
+                                    Some(res) => res,
+                                    None => Err(Box::new(std::io::Error::new(
+                                        std::io::ErrorKind::Other,
+                                        "Python runtime is finalizing or unavailable",
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>),
                                 }
-                            })},
+                            }
                             Err(e) => Err(Box::new(std::io::Error::new(
                                 std::io::ErrorKind::Other,
                                 e.to_string(),
@@ -214,11 +267,20 @@ impl AsyncConnection {
             }
         };
         let handler = Arc::new(move |data| {
-            Box::pin(handler(data)) as Pin<Box<dyn Future<Output = Result<RuMessage, Box<dyn std::error::Error + Send + Sync>>> + Send>>
+            Box::pin(handler(data))
+                as Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<
+                                    RuMessage,
+                                    Box<dyn std::error::Error + Send + Sync>,
+                                >,
+                            > + Send,
+                    >,
+                >
         });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-
             match conn
                 .rpc_server(
                     handler,
@@ -264,7 +326,19 @@ impl AsyncConnection {
         let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            conn.rpc_client(&exchange_name, &routing_key, payload_bytes, &content_type, content_encoding.into(), response_timeout_millis, command_timeout, delivery_mode.into(), expiration).await.map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
+            conn.rpc_client(
+                &exchange_name,
+                &routing_key,
+                payload_bytes,
+                &content_type,
+                content_encoding.into(),
+                response_timeout_millis,
+                command_timeout,
+                delivery_mode.into(),
+                expiration,
+            )
+            .await
+            .map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
         })
     }
 
@@ -280,16 +354,21 @@ impl AsyncConnection {
         let reason = reason.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            conn.update_secret(&new_secret, &reason, command_timeout).await.map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
+            conn.update_secret(&new_secret, &reason, command_timeout)
+                .await
+                .map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
         })
     }
-    
+
     pub fn close<'py>(slf: PyRef<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
         let py = slf.py();
         let conn = Arc::clone(&slf.inner);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            conn.close().await.map_err(|e| PyValueError::new_err(format!("Failed to close connection: {}", e)))
+            conn.close()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("Failed to close connection: {}", e)))?;
+            Ok(())
         })
     }
 }

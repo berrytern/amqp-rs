@@ -1,24 +1,21 @@
-use std::{collections::HashMap, sync::Arc};
+use crate::exceptions::AppError;
 use amqp_client_rust::{
-    amqprs::tls::{TlsAdaptor as RuTlsAdaptor},
-    api::{
-        utils::{
-            ContentEncoding as RuContentEncoding,
-            DeliveryMode as RuDeliveryMode,
-            Message as RuMessage,
-            Confirmations as RuPublishConfirmation,
-            QueueOptions as RuQueueOptions,
-        },
-    }, domain::config::{
+    amqprs::tls::TlsAdaptor as RuTlsAdaptor,
+    api::utils::{
+        Confirmations as RuPublishConfirmation, ContentEncoding as RuContentEncoding,
+        DeliveryMode as RuDeliveryMode, Message as RuMessage, QueueOptions as RuQueueOptions,
+    },
+    domain::config::{
         Config as RuConfig, ConfigOptions as RuConfigOptions, QoSConfig as RuQoSConfig,
-    }
+    },
 };
 use pyo3::{
-    exceptions::PyValueError, prelude::*, types::{PyBytes, PyString}
+    exceptions::PyValueError,
+    prelude::*,
+    types::{PyBytes, PyString},
 };
-use crate::exceptions::AppError;
 use std::path::PathBuf;
-
+use std::{collections::HashMap, sync::Arc};
 
 #[pyclass(from_py_object, get_all, set_all)]
 #[derive(Debug, Clone)]
@@ -91,8 +88,12 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
         match confirm {
             PublishConfirmations::Disables => RuPublishConfirmation::Disables,
             PublishConfirmations::PublisherConfirms => RuPublishConfirmation::PublisherConfirms,
-            PublishConfirmations::RPCClientPublisherConfirms => RuPublishConfirmation::RPCClientPublisherConfirms,
-            PublishConfirmations::RPCServerPublisherConfirms => RuPublishConfirmation::RPCServerPublisherConfirms,
+            PublishConfirmations::RPCClientPublisherConfirms => {
+                RuPublishConfirmation::RPCClientPublisherConfirms
+            }
+            PublishConfirmations::RPCServerPublisherConfirms => {
+                RuPublishConfirmation::RPCServerPublisherConfirms
+            }
         }
     }
 }
@@ -128,10 +129,7 @@ impl Message {
             Payload::Bytes(b) => b.as_bytes().into(),
             Payload::Str(s) => s.to_str()?.as_bytes().into(),
         };
-        Ok(Self {
-            body,
-            content_type,
-        })
+        Ok(Self { body, content_type })
     }
 
     #[getter]
@@ -166,18 +164,29 @@ impl Into<RuContentEncoding> for ContentEncoding {
 #[pyclass(from_py_object, get_all, set_all)]
 #[derive(Debug, Clone)]
 pub struct ConfigOptions {
-    queue_name: String,
-    rpc_exchange_name: String,
-    rpc_queue_name: String,
+    pub queue_name: String,
+    pub rpc_exchange_name: String,
+    pub rpc_queue_name: String,
+    pub dead_letter_exchange: Option<String>,
+    pub dead_letter_routing_key: Option<String>,
 }
 #[pymethods]
 impl ConfigOptions {
     #[new]
-    fn new(queue_name: String, rpc_exchange_name: String, rpc_queue_name: String) -> Self {
+    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None))]
+    fn new(
+        queue_name: String,
+        rpc_exchange_name: String,
+        rpc_queue_name: String,
+        dead_letter_exchange: Option<String>,
+        dead_letter_routing_key: Option<String>,
+    ) -> Self {
         Self {
             queue_name,
             rpc_exchange_name,
             rpc_queue_name,
+            dead_letter_exchange,
+            dead_letter_routing_key,
         }
     }
 }
@@ -187,6 +196,8 @@ impl From<ConfigOptions> for RuConfigOptions {
             queue_name: options.queue_name,
             rpc_exchange_name: options.rpc_exchange_name,
             rpc_queue_name: options.rpc_queue_name,
+            dead_letter_exchange: options.dead_letter_exchange,
+            dead_letter_routing_key: options.dead_letter_routing_key,
         }
     }
 }
@@ -256,11 +267,14 @@ impl TlsAdaptor {
         domain: String,
     ) -> PyResult<Self> {
         amqp_rs_core::install_crypto_provider()?;
-        let (connection, domain) = amqp_rs_core::with_client_auth(ca_path.as_deref(), cert_path.as_path(), key_path.as_path(), domain)?;
+        let (connection, domain) = amqp_rs_core::with_client_auth(
+            ca_path.as_deref(),
+            cert_path.as_path(),
+            key_path.as_path(),
+            domain,
+        )?;
         let tls_adaptor = RuTlsAdaptor::new(connection, domain);
-        let inner = Arc::new(
-            tls_adaptor
-        );
+        let inner = Arc::new(tls_adaptor);
         Ok(Self { inner })
     }
     #[staticmethod]

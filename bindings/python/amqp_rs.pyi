@@ -26,7 +26,16 @@ class ConfigOptions:
     queue_name: str
     rpc_exchange_name: str
     rpc_queue_name: str
-    def __init__(self, queue_name: str, rpc_exchange_name: str, rpc_queue_name: str) -> None: ...
+    dead_letter_exchange: Optional[str]
+    dead_letter_routing_key: Optional[str]
+    def __init__(
+        self,
+        queue_name: str,
+        rpc_exchange_name: str,
+        rpc_queue_name: str,
+        dead_letter_exchange: Optional[str] = None,
+        dead_letter_routing_key: Optional[str] = None,
+    ) -> None: ...
 
 class TlsAdaptor:
     @staticmethod
@@ -272,3 +281,92 @@ class AsyncEventbus:
 
 class Payload:
     def __init__(self, data: bytes) -> None: ...
+
+class PublishConfirmations(Enum):
+    Disables = 0
+    PublisherConfirms = 1
+    RPCClientPublisherConfirms = 2
+    RPCServerPublisherConfirms = 3
+
+class QueueOptions:
+    auto_delete: bool
+    durable: bool
+    exclusive: bool
+    no_create: bool
+    arguments: dict[str, str]
+
+    def __init__(
+        self,
+        auto_delete: bool,
+        durable: bool,
+        exclusive: bool,
+        no_create: bool,
+        arguments: dict[str, str],
+    ) -> None: ...
+
+class AsyncConnection:
+    def __init__(
+        self,
+        config: Config,
+        publish_confirmations: PublishConfirmations,
+        auto_ack: bool,
+        prefetch_count: Optional[int] = None,
+    ) -> None: ...
+
+    def publish(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        body: Union[bytes, str],
+        content_type: str,
+        content_encoding: ContentEncoding,
+        command_timeout: Optional[int] = None,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+        expiration: Optional[int] = None,
+    ) -> Future[None]: ...
+
+    def subscribe(
+        self,
+        handler: Callable[[Message], Awaitable[None]],
+        routing_key: str,
+        exchange_name: str,
+        exchange_type: str,
+        queue_name: str,
+        process_timeout: Optional[int] = None,
+        command_timeout: Optional[int] = None,
+        queue_options: QueueOptions = ...,
+    ) -> Future[None]: ...
+
+    def rpc_server(
+        self,
+        handler: Callable[[Message], Awaitable[Union[Message, bytes]]],
+        routing_key: str,
+        exchange_name: str,
+        exchange_type: str,
+        queue_name: str,
+        process_timeout: Optional[int] = None,
+        command_timeout: Optional[int] = None,
+        queue_options: QueueOptions = ...,
+    ) -> Future[None]: ...
+
+    def rpc_client(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        body: Union[bytes, str],
+        content_type: str,
+        content_encoding: ContentEncoding,
+        response_timeout_millis: int,
+        command_timeout: Optional[int] = None,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+        expiration: Optional[int] = None,
+    ) -> Future[bytes]: ...
+
+    def update_secret(
+        self,
+        new_secret: str,
+        reason: str,
+        command_timeout: Optional[int] = None,
+    ) -> Future[None]: ...
+
+    def close(self) -> Future[None]: ...

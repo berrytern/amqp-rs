@@ -1,3 +1,5 @@
+#!/usr/bin/env bash
+set -e
 
 echo "Running benchmarks..."
 #echo "Publishing and subscribing with pure Python implementation (sequential- asyncio)..."
