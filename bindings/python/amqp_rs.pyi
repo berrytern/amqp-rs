@@ -172,6 +172,21 @@ class AsyncEventbus:
         """
         ...
 
+    def publish_batch(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        messages: list[Union[bytes, str]],
+        content_type: Optional[str] = "application/json",
+        content_encoding: ContentEncoding = ContentEncoding.Null,
+        publish_timeout: int = 16,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+    ) -> Future[None]:
+        """
+        Sends a batch of messages to the bus in a single FFI crossing.
+        """
+        ...
+
     def rpc_client(
         self, 
         exchange_name: str,

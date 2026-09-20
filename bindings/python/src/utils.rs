@@ -136,6 +136,7 @@ impl Message {
     fn body<'py>(slf: PyRef<'py, Self>) -> Bound<'py, PyBytes> {
         PyBytes::new(slf.py(), &slf.body)
     }
+
     #[getter]
     fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()

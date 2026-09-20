@@ -26,6 +26,25 @@ use crate::{
 #[derive(Clone)]
 struct AsyncEventbus {
     eventbus: Arc<RuAsyncEventbusRabbitMQ>,
+    string_cache: Arc<std::sync::RwLock<std::collections::HashSet<Arc<str>>>>,
+}
+
+impl AsyncEventbus {
+    fn intern_string(&self, s: &str) -> Arc<str> {
+        if let Some(existing) = self.string_cache.read().ok().and_then(|c| c.get(s).cloned()) {
+            return existing;
+        }
+        if let Ok(mut cache) = self.string_cache.write() {
+            if let Some(existing) = cache.get(s) {
+                return Arc::clone(existing);
+            }
+            let arc_s: Arc<str> = Arc::from(s);
+            cache.insert(Arc::clone(&arc_s));
+            arc_s
+        } else {
+            Arc::from(s)
+        }
+    }
 }
 
 #[pymethods]
@@ -40,6 +59,7 @@ impl AsyncEventbus {
                 config.into(),
                 qos_config.into(),
             )),
+            string_cache: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -58,23 +78,23 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let exchange_name = exchange_name.to_owned();
-        let routing_key = routing_key.to_owned();
+        let ex = slf.intern_string(exchange_name);
+        let rk = slf.intern_string(routing_key);
+        let ct = content_type.map(|s| slf.intern_string(s));
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
         };
 
-        let content_type = content_type.map(|s| s.to_owned());
         let content_encoding = content_encoding.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let command_timeout = command_timeout.map(std::time::Duration::from_secs);
             match eventbus
                 .publish(
-                    &exchange_name,
-                    &routing_key,
+                    &ex,
+                    &rk,
                     payload_bytes,
-                    content_type.as_deref(),
+                    ct.as_deref(),
                     content_encoding.into(),
                     command_timeout,
                     Some(delivery_mode.into()),
@@ -85,6 +105,69 @@ impl AsyncEventbus {
                 Ok(res) => Ok(res),
                 Err(e) => Err(AppError::from(e).into()),
             }
+        })
+    }
+
+    #[pyo3(signature = (exchange_name, routing_key, messages, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient))]
+    fn publish_batch<'py>(
+        slf: PyRef<'py, Self>,
+        exchange_name: &'py str,
+        routing_key: &'py str,
+        messages: Vec<Payload<'py>>,
+        content_type: Option<&'py str>,
+        content_encoding: ContentEncoding,
+        command_timeout: Option<u64>,
+        delivery_mode: DeliveryMode,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let eventbus = Arc::clone(&slf.eventbus);
+        let py = slf.py();
+
+        let ex = slf.intern_string(exchange_name);
+        let rk = slf.intern_string(routing_key);
+        let ct = content_type.map(|s| slf.intern_string(s));
+        let content_encoding = content_encoding.clone();
+
+        let mut payloads = Vec::with_capacity(messages.len());
+        for body in messages {
+            let b = match body {
+                Payload::Bytes(b) => b.as_bytes().to_vec(),
+                Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
+            };
+            payloads.push(b);
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+            let mut tasks = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let bus = Arc::clone(&eventbus);
+                let ex = Arc::clone(&ex);
+                let rk = Arc::clone(&rk);
+                let ct = ct.clone();
+                let ce = content_encoding.clone();
+                let dm = delivery_mode.clone();
+                tasks.push(tokio::spawn(async move {
+                    bus.publish(
+                        &ex,
+                        &rk,
+                        payload,
+                        ct.as_deref(),
+                        ce.into(),
+                        command_timeout,
+                        Some(dm.into()),
+                        None,
+                    )
+                    .await
+                }));
+            }
+            for task in tasks {
+                match task.await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => return Err(AppError::from(e).into()),
+                    Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                }
+            }
+            Ok(())
         })
     }
 
@@ -103,23 +186,23 @@ impl AsyncEventbus {
     ) -> PyResult<Bound<'py, PyAny>> {
         let eventbus = Arc::clone(&slf.eventbus);
 
-        let exchange_name = exchange_name.to_owned();
-        let routing_key = routing_key.to_owned();
+        let ex = slf.intern_string(exchange_name);
+        let rk = slf.intern_string(routing_key);
+        let ct = slf.intern_string(content_type);
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
         };
-        let content_type = content_type.to_owned();
         let content_encoding = content_encoding.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
             match eventbus
                 .rpc_client(
-                    &exchange_name,
-                    &routing_key,
+                    &ex,
+                    &rk,
                     payload_bytes,
-                    &content_type,
+                    &ct,
                     content_encoding.into(),
                     response_timeout,
                     conn_timeout,
