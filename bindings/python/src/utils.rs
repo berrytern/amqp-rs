@@ -235,29 +235,23 @@ pub struct DeliveryAck {
 #[pymethods]
 impl DeliveryAck {
     pub fn ack(&self) {
-        if let Ok(mut guard) = self.ack_tx.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(Ok(()));
-            }
+        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
+            let _ = tx.send(Ok(()));
         }
     }
 
     pub fn nack(&self, err: Option<String>) {
-        if let Ok(mut guard) = self.ack_tx.lock() {
-            if let Some(tx) = guard.take() {
-                let msg = err.unwrap_or_else(|| "Delivery nacked by subscriber".to_string());
-                let _ = tx.send(Err(Box::new(std::io::Error::other(msg))));
-            }
+        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
+            let msg = err.unwrap_or_else(|| "Delivery nacked by subscriber".to_string());
+            let _ = tx.send(Err(Box::new(std::io::Error::other(msg))));
         }
     }
 }
 
 impl Drop for DeliveryAck {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.ack_tx.lock() {
-            if let Some(tx) = guard.take() {
-                let _ = tx.send(Err(Box::new(std::io::Error::other("Delivery dropped without ACK/NACK"))));
-            }
+        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
+            let _ = tx.send(Err(Box::new(std::io::Error::other("Delivery dropped without ACK/NACK"))));
         }
     }
 }
