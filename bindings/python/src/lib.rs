@@ -69,7 +69,7 @@ impl AsyncEventbus {
                 BatchConfig {
                     enabled: b,
                     max_batch_size: 100,
-                    max_delay_ms: 2,
+                    max_delay_ms: 0,
                 }
             } else if let Ok(cfg) = bc.extract::<BatchConfig>() {
                 cfg
@@ -84,7 +84,7 @@ impl AsyncEventbus {
             BatchConfig {
                 enabled: false,
                 max_batch_size: 100,
-                max_delay_ms: 2,
+                max_delay_ms: 0,
             }
         };
 

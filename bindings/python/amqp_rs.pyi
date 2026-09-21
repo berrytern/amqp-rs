@@ -10,7 +10,7 @@ class Message:
     @staticmethod
     def new(body: bytes, content_type: Optional[str] = None) -> "Message": ...
 
-    
+    def __buffer__(self, flags: int) -> memoryview: ...
 
 class DeliveryMode(Enum):
     Transient = 1
@@ -26,7 +26,7 @@ class BatchConfig:
     enabled: bool
     max_batch_size: int
     max_delay_ms: int
-    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 2) -> None: ...
+    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 0) -> None: ...
     @staticmethod
     def default() -> "BatchConfig": ...
 

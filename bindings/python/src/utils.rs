@@ -103,12 +103,14 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
 pub struct Message {
     body: Arc<[u8]>,
     content_type: Option<String>,
+    cached_body: Arc<std::sync::OnceLock<Py<PyBytes>>>,
 }
 impl From<RuMessage> for Message {
     fn from(msg: RuMessage) -> Self {
         Self {
             body: msg.body,
             content_type: msg.content_type,
+            cached_body: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -129,18 +131,50 @@ impl Message {
             Payload::Bytes(b) => b.as_bytes().into(),
             Payload::Str(s) => s.to_str()?.as_bytes().into(),
         };
-        Ok(Self { body, content_type })
+        Ok(Self {
+            body,
+            content_type,
+            cached_body: Arc::new(std::sync::OnceLock::new()),
+        })
     }
 
     #[getter]
     fn body<'py>(slf: PyRef<'py, Self>) -> Bound<'py, PyBytes> {
-        PyBytes::new(slf.py(), &slf.body)
+        let py = slf.py();
+        let cached = slf.cached_body.get_or_init(|| {
+            PyBytes::new(py, &slf.body).unbind()
+        });
+        cached.bind(py).clone()
     }
 
     #[getter]
     fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
+
+    unsafe fn __getbuffer__(
+        slf: PyRef<'_, Self>,
+        view: *mut pyo3::ffi::Py_buffer,
+        flags: std::os::raw::c_int,
+    ) -> PyResult<()> {
+        let bytes = &slf.body;
+        let ret = unsafe {
+            pyo3::ffi::PyBuffer_FillInfo(
+                view,
+                slf.as_ptr(),
+                bytes.as_ptr() as *mut _,
+                bytes.len() as pyo3::ffi::Py_ssize_t,
+                1,
+                flags,
+            )
+        };
+        if ret == -1 {
+            return Err(PyErr::fetch(slf.py()));
+        }
+        Ok(())
+    }
+
+    unsafe fn __releasebuffer__(&self, _view: *mut pyo3::ffi::Py_buffer) {}
 }
 
 #[pyclass(from_py_object, get_all, set_all)]
@@ -173,7 +207,7 @@ pub struct BatchConfig {
 #[pymethods]
 impl BatchConfig {
     #[new]
-    #[pyo3(signature = (enabled=true, max_batch_size=100, max_delay_ms=2))]
+    #[pyo3(signature = (enabled=true, max_batch_size=100, max_delay_ms=0))]
     pub fn new(enabled: bool, max_batch_size: usize, max_delay_ms: u64) -> Self {
         Self {
             enabled,
@@ -187,7 +221,7 @@ impl BatchConfig {
         Self {
             enabled: false,
             max_batch_size: 100,
-            max_delay_ms: 2,
+            max_delay_ms: 0,
         }
     }
 }
