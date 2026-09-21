@@ -164,23 +164,55 @@ impl Into<RuContentEncoding> for ContentEncoding {
 
 #[pyclass(from_py_object, get_all, set_all)]
 #[derive(Debug, Clone)]
+pub struct BatchConfig {
+    pub enabled: bool,
+    pub max_batch_size: usize,
+    pub max_delay_ms: u64,
+}
+
+#[pymethods]
+impl BatchConfig {
+    #[new]
+    #[pyo3(signature = (enabled=true, max_batch_size=100, max_delay_ms=2))]
+    pub fn new(enabled: bool, max_batch_size: usize, max_delay_ms: u64) -> Self {
+        Self {
+            enabled,
+            max_batch_size,
+            max_delay_ms,
+        }
+    }
+
+    #[staticmethod]
+    pub fn default() -> Self {
+        Self {
+            enabled: false,
+            max_batch_size: 100,
+            max_delay_ms: 2,
+        }
+    }
+}
+
+#[pyclass(from_py_object, get_all, set_all)]
+#[derive(Debug, Clone)]
 pub struct ConfigOptions {
     pub queue_name: String,
     pub rpc_exchange_name: String,
     pub rpc_queue_name: String,
     pub dead_letter_exchange: Option<String>,
     pub dead_letter_routing_key: Option<String>,
+    pub batch_config: Option<BatchConfig>,
 }
 #[pymethods]
 impl ConfigOptions {
     #[new]
-    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None))]
+    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None))]
     fn new(
         queue_name: String,
         rpc_exchange_name: String,
         rpc_queue_name: String,
         dead_letter_exchange: Option<String>,
         dead_letter_routing_key: Option<String>,
+        batch_config: Option<BatchConfig>,
     ) -> Self {
         Self {
             queue_name,
@@ -188,6 +220,7 @@ impl ConfigOptions {
             rpc_queue_name,
             dead_letter_exchange,
             dead_letter_routing_key,
+            batch_config,
         }
     }
 }

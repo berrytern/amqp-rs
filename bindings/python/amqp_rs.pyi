@@ -22,12 +22,21 @@ class ContentEncoding(Enum):
     Zlib = 'zlib',
     Null = 'null'
 
+class BatchConfig:
+    enabled: bool
+    max_batch_size: int
+    max_delay_ms: int
+    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 2) -> None: ...
+    @staticmethod
+    def default() -> "BatchConfig": ...
+
 class ConfigOptions:
     queue_name: str
     rpc_exchange_name: str
     rpc_queue_name: str
     dead_letter_exchange: Optional[str]
     dead_letter_routing_key: Optional[str]
+    batch_config: Optional[BatchConfig]
     def __init__(
         self,
         queue_name: str,
@@ -35,6 +44,7 @@ class ConfigOptions:
         rpc_queue_name: str,
         dead_letter_exchange: Optional[str] = None,
         dead_letter_routing_key: Optional[str] = None,
+        batch_config: Optional[BatchConfig] = None,
     ) -> None: ...
 
 class TlsAdaptor:
@@ -98,7 +108,15 @@ class QoSConfig:
     
 
 class AsyncEventbus:
-    def __init__(self, config: Config, qos_config: QoSConfig) -> None:
+    @property
+    def batch_config(self) -> BatchConfig: ...
+
+    def __init__(
+        self,
+        config: Config,
+        qos_config: QoSConfig,
+        batch_config: Optional[Union[bool, BatchConfig]] = None,
+    ) -> None: ...
         """
         Create an AsyncEventbus object thats interacts with Bus
         thats provides some connection management abstractions.
