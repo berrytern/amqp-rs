@@ -226,6 +226,42 @@ impl BatchConfig {
     }
 }
 
+#[pyclass(from_py_object)]
+#[derive(Clone)]
+pub struct DeliveryAck {
+    pub ack_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>>>,
+}
+
+#[pymethods]
+impl DeliveryAck {
+    pub fn ack(&self) {
+        if let Ok(mut guard) = self.ack_tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(Ok(()));
+            }
+        }
+    }
+
+    pub fn nack(&self, err: Option<String>) {
+        if let Ok(mut guard) = self.ack_tx.lock() {
+            if let Some(tx) = guard.take() {
+                let msg = err.unwrap_or_else(|| "Delivery nacked by subscriber".to_string());
+                let _ = tx.send(Err(Box::new(std::io::Error::other(msg))));
+            }
+        }
+    }
+}
+
+impl Drop for DeliveryAck {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.ack_tx.lock() {
+            if let Some(tx) = guard.take() {
+                let _ = tx.send(Err(Box::new(std::io::Error::other("Delivery dropped without ACK/NACK"))));
+            }
+        }
+    }
+}
+
 #[pyclass(from_py_object, get_all, set_all)]
 #[derive(Debug, Clone)]
 pub struct ConfigOptions {

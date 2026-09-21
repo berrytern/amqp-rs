@@ -30,6 +30,10 @@ class BatchConfig:
     @staticmethod
     def default() -> "BatchConfig": ...
 
+class DeliveryAck:
+    def ack(self) -> None: ...
+    def nack(self, err: Optional[str] = None) -> None: ...
+
 class ConfigOptions:
     queue_name: str
     rpc_exchange_name: str
@@ -252,9 +256,10 @@ class AsyncEventbus:
         self,
         exchange_name: str,
         routing_key: str,
-        handler: Callable[[bytes], None],
+        handler: Callable[[Message], Any],
         process_timeout: Optional[int] = None,
         command_timeout: int = 16,
+        batch_dispatch: Optional[bool] = None,
     ) -> Future[None]:
         """
         Register a provider to listen on queue of bus
@@ -265,17 +270,35 @@ class AsyncEventbus:
             handler: message handler, it will be called when a message is received
             process_timeout: timeout in seconds for waiting for process the received message
             command_timeout: timeout for waiting for command execution
+            batch_dispatch: optional override to enable/disable FFI batch dispatching
         Returns:
             None: None
+        """
+        ...
 
-        Examples:
-            >>> async def handle(body) -> None:
-                    print(f"received message: {body}")
-            >>> exchange_name = "example"
-            >>> routing_key = "user.find3"
-            >>> process_timeout = 20
-            >>> command_timeout = 16
-            >>> await eventbus.subscribe(exchange_name, routing_key, handle, process_timeout, command_timeout)
+    def subscribe_batch(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        handler: Callable[[list[Message]], Any],
+        batch_size: int = 100,
+        max_delay_ms: int = 0,
+        process_timeout: Optional[int] = None,
+        command_timeout: int = 16,
+    ) -> Future[None]:
+        """
+        Register a batch provider to receive batches of messages directly.
+
+        Args:
+            exchange_name: exchange name
+            routing_key: routing_key name
+            handler: batch handler receiving list[Message]
+            batch_size: maximum number of messages per batch
+            max_delay_ms: maximum delay in ms to wait for batch assembly
+            process_timeout: timeout in seconds for waiting for process the received message
+            command_timeout: timeout for waiting for command execution
+        Returns:
+            None: None
         """
         ...
 
