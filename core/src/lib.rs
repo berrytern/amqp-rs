@@ -82,7 +82,7 @@ pub fn with_client_auth(
                 )
             })?,
         )
-        .unwrap();
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     let connector = TlsConnector::from(Arc::new(config));
 
     Ok((connector, domain))

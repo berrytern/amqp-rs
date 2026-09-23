@@ -811,21 +811,11 @@ impl AsyncEventbus {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current()
-                    .block_on(async move { eventbus.dispose().await.map_err(|e| e.to_string()) })
+                    .block_on(async move { eventbus.dispose().await })
+                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
             })
             .await
-            .map_err(|e| AppError {
-                description: Some(e.to_string()),
-                message: None,
-                error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
-            })?
-            .map_err(|_| AppError {
-                description: None,
-                message: None,
-                error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
-            })?;
-
-            Ok(())
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
         })
     }
 }

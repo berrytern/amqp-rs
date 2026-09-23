@@ -75,7 +75,7 @@ impl AsyncConnection {
                 expiration,
             )
             .await
-            .map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
+            .map_err(|e| PyValueError::new_err(format!("Failed to publish message: {}", e)))
         })
     }
 
@@ -338,7 +338,7 @@ impl AsyncConnection {
                 expiration,
             )
             .await
-            .map_err(|e| PyValueError::new_err(format!("Failed to update secret: {}", e)))
+            .map_err(|e| PyValueError::new_err(format!("Failed to execute RPC request: {}", e)))
         })
     }
 

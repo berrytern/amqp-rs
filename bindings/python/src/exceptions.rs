@@ -22,7 +22,12 @@ pub struct AppError {
 
 impl Display for AppError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, r"\{{ {:?}, {:?})\}}", self.message, self.description)
+        match (&self.message, &self.description) {
+            (Some(msg), Some(desc)) => write!(f, "{}: {}", msg, desc),
+            (Some(msg), None) => write!(f, "{}", msg),
+            (None, Some(desc)) => write!(f, "{}", desc),
+            (None, None) => write!(f, "{:?}", self.error_type),
+        }
     }
 }
 
