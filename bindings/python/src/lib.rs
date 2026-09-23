@@ -68,26 +68,14 @@ fn get_dispatch_bulk(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 #[derive(Clone)]
 struct AsyncEventbus {
     eventbus: Arc<RuAsyncEventbusRabbitMQ>,
-    string_cache: Arc<std::sync::RwLock<std::collections::HashSet<Arc<str>>>>,
     batch_sender: Option<tokio::sync::mpsc::UnboundedSender<BatchItem>>,
     batch_config: BatchConfig,
 }
 
 impl AsyncEventbus {
+    #[inline]
     fn intern_string(&self, s: &str) -> Arc<str> {
-        if let Some(existing) = self.string_cache.read().ok().and_then(|c| c.get(s).cloned()) {
-            return existing;
-        }
-        if let Ok(mut cache) = self.string_cache.write() {
-            if let Some(existing) = cache.get(s) {
-                return Arc::clone(existing);
-            }
-            let arc_s: Arc<str> = Arc::from(s);
-            cache.insert(Arc::clone(&arc_s));
-            arc_s
-        } else {
-            Arc::from(s)
-        }
+        Arc::from(s)
     }
 }
 
@@ -193,7 +181,6 @@ impl AsyncEventbus {
 
         Ok(Self {
             eventbus,
-            string_cache: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             batch_sender,
             batch_config: resolved_batch_config,
         })
