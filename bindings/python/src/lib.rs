@@ -3,6 +3,7 @@ use amqp_client_rust::api::{
 };
 use pyo3::{prelude::*, types::PyBytes};
 use std::sync::Arc;
+pub use amqp_client_rust;
 pub mod api;
 pub mod exceptions;
 pub mod utils;
@@ -64,61 +65,22 @@ fn get_dispatch_bulk(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     Ok(py_any.bind(py).clone())
 }
 
-#[pyclass(skip_from_py_object)]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
-struct AsyncEventbus {
-    eventbus: Arc<RuAsyncEventbusRabbitMQ>,
+pub struct AsyncEventbus {
+    pub eventbus: Arc<RuAsyncEventbusRabbitMQ>,
     batch_sender: Option<tokio::sync::mpsc::UnboundedSender<BatchItem>>,
     batch_config: BatchConfig,
 }
 
 impl AsyncEventbus {
-    #[inline]
-    fn intern_string(&self, s: &str) -> Arc<str> {
-        Arc::from(s)
-    }
-}
-
-#[pymethods]
-impl AsyncEventbus {
-    #[new]
-    #[pyo3(signature = (config, qos_config, batch_config=None))]
-    fn new(
-        config: Config,
-        qos_config: QoSConfig,
-        batch_config: Option<Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        let resolved_batch_config = if let Some(bc) = batch_config {
-            if let Ok(b) = bc.extract::<bool>() {
-                BatchConfig {
-                    enabled: b,
-                    max_batch_size: 100,
-                    max_delay_ms: 0,
-                }
-            } else if let Ok(cfg) = bc.extract::<BatchConfig>() {
-                cfg
-            } else {
-                return Err(pyo3::exceptions::PyTypeError::new_err(
-                    "batch_config must be a bool or an instance of BatchConfig",
-                ));
-            }
-        } else if let Some(cfg) = &config.options.batch_config {
-            cfg.clone()
-        } else {
-            BatchConfig {
-                enabled: false,
-                max_batch_size: 100,
-                max_delay_ms: 0,
-            }
-        };
-
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let _guard = rt.enter();
-
-        let eventbus = Arc::new(RuAsyncEventbusRabbitMQ::new(
-            config.into(),
-            qos_config.into(),
-        ));
+    /// Creates an `AsyncEventbus` from an existing native Rust `RuAsyncEventbusRabbitMQ`.
+    pub fn from_inner(eventbus: Arc<RuAsyncEventbusRabbitMQ>, batch_config: Option<BatchConfig>) -> Self {
+        let resolved_batch_config = batch_config.unwrap_or(BatchConfig {
+            enabled: false,
+            max_batch_size: 100,
+            max_delay_ms: 0,
+        });
 
         let batch_sender = if resolved_batch_config.enabled {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BatchItem>();
@@ -179,11 +141,69 @@ impl AsyncEventbus {
             None
         };
 
-        Ok(Self {
+        Self {
             eventbus,
             batch_sender,
             batch_config: resolved_batch_config,
-        })
+        }
+    }
+
+    /// Returns a cloned `Arc` to the underlying native Rust `RuAsyncEventbusRabbitMQ`.
+    ///
+    /// This allows Rust code to call AMQP publish/subscribe directly with zero FFI overhead.
+    #[inline]
+    pub fn inner(&self) -> Arc<RuAsyncEventbusRabbitMQ> {
+        Arc::clone(&self.eventbus)
+    }
+
+    #[inline]
+    fn intern_string(&self, s: &str) -> Arc<str> {
+        Arc::from(s)
+    }
+}
+
+#[pymethods]
+impl AsyncEventbus {
+    #[new]
+    #[pyo3(signature = (config, qos_config, batch_config=None))]
+    fn new(
+        config: Config,
+        qos_config: QoSConfig,
+        batch_config: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let resolved_batch_config = if let Some(bc) = batch_config {
+            if let Ok(b) = bc.extract::<bool>() {
+                BatchConfig {
+                    enabled: b,
+                    max_batch_size: 100,
+                    max_delay_ms: 0,
+                }
+            } else if let Ok(cfg) = bc.extract::<BatchConfig>() {
+                cfg
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "batch_config must be a bool or an instance of BatchConfig",
+                ));
+            }
+        } else if let Some(cfg) = &config.options.batch_config {
+            cfg.clone()
+        } else {
+            BatchConfig {
+                enabled: false,
+                max_batch_size: 100,
+                max_delay_ms: 0,
+            }
+        };
+
+        let rt = pyo3_async_runtimes::tokio::get_runtime();
+        let _guard = rt.enter();
+
+        let eventbus = Arc::new(RuAsyncEventbusRabbitMQ::new(
+            config.into(),
+            qos_config.into(),
+        ));
+
+        Ok(Self::from_inner(eventbus, Some(resolved_batch_config)))
     }
 
     #[getter]
