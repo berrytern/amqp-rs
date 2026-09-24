@@ -80,6 +80,7 @@ impl AsyncEventbus {
             enabled: false,
             max_batch_size: 100,
             max_delay_ms: 0,
+            max_payload_bytes: 1024,
         });
 
         let batch_sender = if resolved_batch_config.enabled {
@@ -177,6 +178,7 @@ impl AsyncEventbus {
                     enabled: b,
                     max_batch_size: 100,
                     max_delay_ms: 0,
+                    max_payload_bytes: 1024,
                 }
             } else if let Ok(cfg) = bc.extract::<BatchConfig>() {
                 cfg
@@ -192,6 +194,7 @@ impl AsyncEventbus {
                 enabled: false,
                 max_batch_size: 100,
                 max_delay_ms: 0,
+                max_payload_bytes: 1024,
             }
         };
 
@@ -236,55 +239,57 @@ impl AsyncEventbus {
         let cmd_timeout = command_timeout.map(std::time::Duration::from_secs);
 
         if let Some(sender) = &slf.batch_sender {
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            let item = BatchItem {
-                exchange: ex,
-                routing_key: rk,
-                payload: payload_bytes,
-                content_type: ct,
-                content_encoding,
-                command_timeout: cmd_timeout,
-                delivery_mode,
-                expiration,
-                ack_sender: ack_tx,
-            };
+            if payload_bytes.len() <= slf.batch_config.max_payload_bytes {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let item = BatchItem {
+                    exchange: ex,
+                    routing_key: rk,
+                    payload: payload_bytes,
+                    content_type: ct,
+                    content_encoding,
+                    command_timeout: cmd_timeout,
+                    delivery_mode,
+                    expiration,
+                    ack_sender: ack_tx,
+                };
 
-            if let Err(e) = sender.send(item) {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                    "Batch sender channel closed: {}", e
-                )));
+                if let Err(e) = sender.send(item) {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch sender channel closed: {}", e
+                    )));
+                }
+
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    match ack_rx.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.into()),
+                        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "Batch acknowledgment channel closed",
+                        )),
+                    }
+                });
             }
-
-            pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                match ack_rx.await {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(e.into()),
-                    Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
-                        "Batch acknowledgment channel closed",
-                    )),
-                }
-            })
-        } else {
-            let content_encoding = content_encoding.clone();
-            pyo3_async_runtimes::tokio::future_into_py(py, async move {
-                match eventbus
-                    .publish(
-                        &ex,
-                        &rk,
-                        payload_bytes,
-                        ct.as_deref(),
-                        content_encoding.into(),
-                        cmd_timeout,
-                        Some(delivery_mode.into()),
-                        expiration,
-                    )
-                    .await
-                {
-                    Ok(res) => Ok(res),
-                    Err(e) => Err(AppError::from(e).into()),
-                }
-            })
         }
+
+        let content_encoding = content_encoding.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match eventbus
+                .publish(
+                    &ex,
+                    &rk,
+                    payload_bytes,
+                    ct.as_deref(),
+                    content_encoding.into(),
+                    cmd_timeout,
+                    Some(delivery_mode.into()),
+                    expiration,
+                )
+                .await
+            {
+                Ok(res) => Ok(res),
+                Err(e) => Err(AppError::from(e).into()),
+            }
+        })
     }
 
     #[pyo3(signature = (exchange_name, routing_key, messages, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient))]

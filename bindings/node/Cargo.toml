@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 amqp-rs-core = { path = "../../core" }
 
 # Node-specific dependencies
-amqp-client-rust = { version = "=0.0.7", features = [
+amqp-client-rust = { version = "=0.0.8", features = [
   "tls",
   "zstd",
   "lz4_flex",

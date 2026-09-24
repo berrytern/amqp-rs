@@ -26,7 +26,8 @@ class BatchConfig:
     enabled: bool
     max_batch_size: int
     max_delay_ms: int
-    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 0) -> None: ...
+    max_payload_bytes: int
+    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 0, max_payload_bytes: int = 1024) -> None: ...
     @staticmethod
     def default() -> "BatchConfig": ...
 
@@ -41,6 +42,7 @@ class ConfigOptions:
     dead_letter_exchange: Optional[str]
     dead_letter_routing_key: Optional[str]
     batch_config: Optional[BatchConfig]
+    max_pending_commands: Optional[int]
     def __init__(
         self,
         queue_name: str,
@@ -49,6 +51,7 @@ class ConfigOptions:
         dead_letter_exchange: Optional[str] = None,
         dead_letter_routing_key: Optional[str] = None,
         batch_config: Optional[BatchConfig] = None,
+        max_pending_commands: Optional[int] = None,
     ) -> None: ...
 
 class TlsAdaptor:

@@ -202,17 +202,19 @@ pub struct BatchConfig {
     pub enabled: bool,
     pub max_batch_size: usize,
     pub max_delay_ms: u64,
+    pub max_payload_bytes: usize,
 }
 
 #[pymethods]
 impl BatchConfig {
     #[new]
-    #[pyo3(signature = (enabled=true, max_batch_size=100, max_delay_ms=0))]
-    pub fn new(enabled: bool, max_batch_size: usize, max_delay_ms: u64) -> Self {
+    #[pyo3(signature = (enabled=true, max_batch_size=100, max_delay_ms=0, max_payload_bytes=1024))]
+    pub fn new(enabled: bool, max_batch_size: usize, max_delay_ms: u64, max_payload_bytes: usize) -> Self {
         Self {
             enabled,
             max_batch_size,
             max_delay_ms,
+            max_payload_bytes,
         }
     }
 
@@ -222,6 +224,7 @@ impl BatchConfig {
             enabled: false,
             max_batch_size: 100,
             max_delay_ms: 0,
+            max_payload_bytes: 1024,
         }
     }
 }
@@ -265,11 +268,12 @@ pub struct ConfigOptions {
     pub dead_letter_exchange: Option<String>,
     pub dead_letter_routing_key: Option<String>,
     pub batch_config: Option<BatchConfig>,
+    pub max_pending_commands: Option<usize>,
 }
 #[pymethods]
 impl ConfigOptions {
     #[new]
-    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None))]
+    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None, max_pending_commands=None))]
     fn new(
         queue_name: String,
         rpc_exchange_name: String,
@@ -277,6 +281,7 @@ impl ConfigOptions {
         dead_letter_exchange: Option<String>,
         dead_letter_routing_key: Option<String>,
         batch_config: Option<BatchConfig>,
+        max_pending_commands: Option<usize>,
     ) -> Self {
         Self {
             queue_name,
@@ -285,6 +290,7 @@ impl ConfigOptions {
             dead_letter_exchange,
             dead_letter_routing_key,
             batch_config,
+            max_pending_commands,
         }
     }
 }
@@ -296,6 +302,7 @@ impl From<ConfigOptions> for RuConfigOptions {
             rpc_queue_name: options.rpc_queue_name,
             dead_letter_exchange: options.dead_letter_exchange,
             dead_letter_routing_key: options.dead_letter_routing_key,
+            max_pending_commands: options.max_pending_commands.unwrap_or(10_000),
         }
     }
 }

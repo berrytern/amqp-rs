@@ -90,6 +90,7 @@ pub struct ConfigOptions {
   pub rpc_queue_name: String,
   pub dead_letter_exchange: Option<String>,
   pub dead_letter_routing_key: Option<String>,
+  pub max_pending_commands: Option<u32>,
 }
 
 impl From<ConfigOptions> for RuConfigOptions {
@@ -100,6 +101,7 @@ impl From<ConfigOptions> for RuConfigOptions {
       rpc_queue_name: options.rpc_queue_name,
       dead_letter_exchange: options.dead_letter_exchange,
       dead_letter_routing_key: options.dead_letter_routing_key,
+      max_pending_commands: options.max_pending_commands.map(|v| v as usize).unwrap_or(10_000),
     }
   }
 }
