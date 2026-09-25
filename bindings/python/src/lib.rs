@@ -1,5 +1,9 @@
 use amqp_client_rust::api::{
-    eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ, utils::Message as RuMessage,
+    eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
+    utils::{
+        Message as RuMessage, PublishOptions as RuPublishOptions,
+        RpcClientOptions as RuRpcClientOptions,
+    },
 };
 use pyo3::{prelude::*, types::PyBytes};
 use std::sync::Arc;
@@ -122,15 +126,18 @@ impl AsyncEventbus {
                     for item in batch.drain(..) {
                         let b = Arc::clone(&bus);
                         tokio::spawn(async move {
+                            let pub_opts = RuPublishOptions {
+                                content_type: item.content_type.as_deref().unwrap_or("application/json"),
+                                content_encoding: item.content_encoding.into(),
+                                command_timeout: item.command_timeout,
+                                delivery_mode: item.delivery_mode.into(),
+                                expiration: item.expiration,
+                            };
                             let res = b.publish(
                                 &item.exchange,
                                 &item.routing_key,
                                 item.payload,
-                                item.content_type.as_deref(),
-                                item.content_encoding.into(),
-                                item.command_timeout,
-                                Some(item.delivery_mode.into()),
-                                item.expiration,
+                                &pub_opts,
                             ).await;
                             let _ = item.ack_sender.send(res.map_err(AppError::from));
                         });
@@ -214,6 +221,7 @@ impl AsyncEventbus {
         self.batch_config.clone()
     }
 
+    #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
     #[pyo3(signature = (exchange_name, routing_key, body, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient, expiration=None))]
     fn publish<'py>(
         slf: PyRef<'py, Self>,
@@ -273,16 +281,19 @@ impl AsyncEventbus {
 
         let content_encoding = content_encoding.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pub_opts = RuPublishOptions {
+                content_type: ct.as_deref().unwrap_or("application/json"),
+                content_encoding: content_encoding.into(),
+                command_timeout: cmd_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
             match eventbus
                 .publish(
                     &ex,
                     &rk,
                     payload_bytes,
-                    ct.as_deref(),
-                    content_encoding.into(),
-                    cmd_timeout,
-                    Some(delivery_mode.into()),
-                    expiration,
+                    &pub_opts,
                 )
                 .await
             {
@@ -292,6 +303,7 @@ impl AsyncEventbus {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (exchange_name, routing_key, messages, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient))]
     fn publish_batch<'py>(
         slf: PyRef<'py, Self>,
@@ -331,15 +343,18 @@ impl AsyncEventbus {
                 let ce = content_encoding.clone();
                 let dm = delivery_mode.clone();
                 tasks.push(tokio::spawn(async move {
+                    let pub_opts = RuPublishOptions {
+                        content_type: ct.as_deref().unwrap_or("application/json"),
+                        content_encoding: ce.into(),
+                        command_timeout,
+                        delivery_mode: dm.into(),
+                        expiration: None,
+                    };
                     bus.publish(
                         &ex,
                         &rk,
                         payload,
-                        ct.as_deref(),
-                        ce.into(),
-                        command_timeout,
-                        Some(dm.into()),
-                        None,
+                        &pub_opts,
                     )
                     .await
                 }));
@@ -355,6 +370,7 @@ impl AsyncEventbus {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (exchange_name, routing_key, body, content_type="application/json", content_encoding=ContentEncoding::Null, response_timeout=20_000, connection_timeout=Some(32), delivery_mode=DeliveryMode::Transient, expiration=None))]
     fn rpc_client<'py>(
         slf: PyRef<'py, Self>,
@@ -381,17 +397,20 @@ impl AsyncEventbus {
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
+            let rpc_opts = RuRpcClientOptions {
+                content_type: &ct,
+                content_encoding: content_encoding.into(),
+                response_timeout_millis: response_timeout,
+                command_timeout: conn_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
             match eventbus
                 .rpc_client(
                     &ex,
                     &rk,
                     payload_bytes,
-                    &ct,
-                    content_encoding.into(),
-                    response_timeout,
-                    conn_timeout,
-                    Some(delivery_mode.into()),
-                    expiration,
+                    &rpc_opts,
                 )
                 .await
             {
@@ -579,6 +598,7 @@ impl AsyncEventbus {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (exchange_name, routing_key, handler, batch_size=100, max_delay_ms=0, process_timeout=None, command_timeout=Some(16)))]
     fn subscribe_batch<'py>(
         slf: PyRef<'py, Self>,
@@ -754,8 +774,7 @@ impl AsyncEventbus {
                                     }) {
                                         Some(res) => res,
                                         None => {
-                                            return Err(Box::new(std::io::Error::new(
-                                                std::io::ErrorKind::Other,
+                                            return Err(Box::new(std::io::Error::other(
                                                 "Python runtime is finalizing or unavailable",
                                             ))
                                                 as Box<dyn std::error::Error + Send + Sync>);
@@ -783,21 +802,18 @@ impl AsyncEventbus {
                                                 }
                                             }) {
                                                 Some(res) => res,
-                                                None => Err(Box::new(std::io::Error::new(
-                                                    std::io::ErrorKind::Other,
+                                                None => Err(Box::new(std::io::Error::other(
                                                     "Python runtime is finalizing or unavailable",
                                                 ))
                                                     as Box<dyn std::error::Error + Send + Sync>),
                                             }
                                         }
-                                        Err(e) => Err(Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
+                                        Err(e) => Err(Box::new(std::io::Error::other(
                                             e.to_string(),
                                         ))
                                             as Box<dyn std::error::Error + Send + Sync>),
                                     },
-                                    Err(e) => Err(Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
+                                    Err(e) => Err(Box::new(std::io::Error::other(
                                         format!("Failed to execute Python callback: {}", e),
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>),

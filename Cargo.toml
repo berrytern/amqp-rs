@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+amqp-client-rust = { path = "../amqp-client-rust/amqp-client-rust" }
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

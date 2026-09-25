@@ -2,62 +2,19 @@
 /* eslint-disable */
 export declare class AsyncEventbus {
   static connect(config: Config, qosConfig: QoSConfig): Promise<AsyncEventbus>
-  publish(
-    exchangeName: string,
-    routingKey: string,
-    body: Buffer | string,
-    contentType: string | undefined | null,
-    contentEncoding: ContentEncoding,
-    commandTimeout: number | undefined | null,
-    deliveryMode: DeliveryMode,
-    expiration?: number | undefined | null,
-  ): Promise<void>
-  rpcClient(
-    exchangeName: string,
-    routingKey: string,
-    body: Buffer | string,
-    contentType: string,
-    contentEncoding: ContentEncoding,
-    responseTimeout: number,
-    connectionTimeout: number | undefined | null,
-    deliveryMode: DeliveryMode,
-    expiration?: number | undefined | null,
-  ): Promise<Buffer>
-  subscribe(
-    exchangeName: string,
-    routingKey: string,
-    handler: (msg: Message) => Promise<void>,
-    processTimeout?: number | undefined | null,
-    commandTimeout?: number | undefined | null,
-  ): Promise<void>
-  provideResource(
-    routingKey: string,
-    handler: (msg: Message) => Promise<Buffer | Message>,
-    processTimeout?: number | undefined | null,
-    commandTimeout?: number | undefined | null,
-  ): Promise<void>
+  publish(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string | undefined | null, contentEncoding: ContentEncoding, commandTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<void>
+  rpcClient(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string, contentEncoding: ContentEncoding, responseTimeout: number, connectionTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<Buffer>
+  subscribe(exchangeName: string, routingKey: string, handler: (msg: Message) => Promise<void>, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
+  provideResource(routingKey: string, handler: (msg: Message) => Promise<Buffer | Message>, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
   dispose(): Promise<void>
 }
 
 export declare class Config {
-  constructor(
-    host: string,
-    port: number,
-    username: string,
-    password: string,
-    virtualHost: string,
-    options: ConfigOptions,
-    tlsAdaptor?: TlsAdaptor | undefined | null,
-  )
+  constructor(host: string, port: number, username: string, password: string, virtualHost: string, options: ConfigOptions, tlsAdaptor?: TlsAdaptor | undefined | null)
 }
 
 export declare class TlsAdaptor {
-  static withClientAuth(
-    caPath: string | undefined | null,
-    certPath: string,
-    keyPath: string,
-    domain: string,
-  ): TlsAdaptor
+  static withClientAuth(caPath: string | undefined | null, certPath: string, keyPath: string, domain: string): TlsAdaptor
   static withoutClientAuth(rootCaCert: string | undefined | null, domain: string): TlsAdaptor
 }
 
@@ -67,18 +24,21 @@ export interface ConfigOptions {
   rpcQueueName: string
   deadLetterExchange?: string
   deadLetterRoutingKey?: string
+  maxPendingCommands?: number
+  maxPendingBytes?: number
+  failFastOnDisconnect?: boolean
 }
 
 export declare const enum ContentEncoding {
   Zstd = 'Zstd',
   Lz4 = 'Lz4',
   Zlib = 'Zlib',
-  Null = 'Null',
+  Null = 'Null'
 }
 
 export declare const enum DeliveryMode {
   Transient = 1,
-  Persistent = 2,
+  Persistent = 2
 }
 
 export interface Message {

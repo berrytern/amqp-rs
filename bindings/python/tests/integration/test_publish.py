@@ -26,3 +26,25 @@ async def test_subscribe():
     assert isinstance(response, Message)
     assert response.body == message
     await eventbus.dispose()
+
+@pytest.mark.asyncio
+async def test_fail_fast_on_disconnect():
+    options = ConfigOptions('q', 'rq', 're', fail_fast_on_disconnect=True)
+    config = Config('127.0.0.1', 59998, 'guest', 'guest', '/', options)
+    qos = QoSConfig(False, False, False, False, False, False)
+    bus = AsyncEventbus(config, qos)
+    with pytest.raises(Exception) as exc_info:
+        await bus.publish('ex', 'rk', b'test', 'text/plain', ContentEncoding.Null, 100)
+    assert 'Connection is unavailable' in str(exc_info.value)
+    await bus.dispose()
+
+@pytest.mark.asyncio
+async def test_max_pending_commands_zero():
+    options = ConfigOptions('q', 'rq', 're', max_pending_commands=0)
+    config = Config('127.0.0.1', 59998, 'guest', 'guest', '/', options)
+    qos = QoSConfig(False, False, False, False, False, False)
+    bus = AsyncEventbus(config, qos)
+    with pytest.raises(Exception) as exc_info:
+        await bus.publish('ex', 'rk', b'test', 'text/plain', ContentEncoding.Null, 100)
+    assert 'Connection is unavailable' in str(exc_info.value)
+    await bus.dispose()

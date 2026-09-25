@@ -43,6 +43,8 @@ class ConfigOptions:
     dead_letter_routing_key: Optional[str]
     batch_config: Optional[BatchConfig]
     max_pending_commands: Optional[int]
+    max_pending_bytes: Optional[int]
+    fail_fast_on_disconnect: Optional[bool]
     def __init__(
         self,
         queue_name: str,
@@ -52,6 +54,8 @@ class ConfigOptions:
         dead_letter_routing_key: Optional[str] = None,
         batch_config: Optional[BatchConfig] = None,
         max_pending_commands: Optional[int] = None,
+        max_pending_bytes: Optional[int] = None,
+        fail_fast_on_disconnect: Optional[bool] = None,
     ) -> None: ...
 
 class TlsAdaptor:

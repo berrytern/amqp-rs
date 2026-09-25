@@ -64,7 +64,7 @@ impl QueueOptions {
 
 impl QueueOptions {
     pub fn to_ru_options(options: QueueOptions) -> Result<RuQueueOptions, AppError> {
-        let queue_options = RuQueueOptions::build()
+        let queue_options = RuQueueOptions::new()
             .auto_delete(options.auto_delete)
             .durable(options.durable)
             .exclusive(options.exclusive)
@@ -86,7 +86,7 @@ pub enum PublishConfirmations {
 impl From<PublishConfirmations> for RuPublishConfirmation {
     fn from(confirm: PublishConfirmations) -> Self {
         match confirm {
-            PublishConfirmations::Disables => RuPublishConfirmation::Disables,
+            PublishConfirmations::Disables => RuPublishConfirmation::Disabled,
             PublishConfirmations::PublisherConfirms => RuPublishConfirmation::PublisherConfirms,
             PublishConfirmations::RPCClientPublisherConfirms => {
                 RuPublishConfirmation::RPCClientPublisherConfirms
@@ -185,9 +185,9 @@ pub enum ContentEncoding {
     Zlib,
     Null,
 }
-impl Into<RuContentEncoding> for ContentEncoding {
-    fn into(self) -> RuContentEncoding {
-        match self {
+impl From<ContentEncoding> for RuContentEncoding {
+    fn from(encoding: ContentEncoding) -> Self {
+        match encoding {
             ContentEncoding::Zstd => RuContentEncoding::Zstd,
             ContentEncoding::Lz4 => RuContentEncoding::Lz4,
             ContentEncoding::Zlib => RuContentEncoding::Zlib,
@@ -205,6 +205,17 @@ pub struct BatchConfig {
     pub max_payload_bytes: usize,
 }
 
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_batch_size: 100,
+            max_delay_ms: 0,
+            max_payload_bytes: 1024,
+        }
+    }
+}
+
 #[pymethods]
 impl BatchConfig {
     #[new]
@@ -219,20 +230,18 @@ impl BatchConfig {
     }
 
     #[staticmethod]
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
-        Self {
-            enabled: false,
-            max_batch_size: 100,
-            max_delay_ms: 0,
-            max_payload_bytes: 1024,
-        }
+        Default::default()
     }
 }
+
+type AckSender = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct DeliveryAck {
-    pub ack_tx: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>>>>,
+    pub ack_tx: Arc<std::sync::Mutex<Option<AckSender>>>,
 }
 
 #[pymethods]
@@ -269,11 +278,14 @@ pub struct ConfigOptions {
     pub dead_letter_routing_key: Option<String>,
     pub batch_config: Option<BatchConfig>,
     pub max_pending_commands: Option<usize>,
+    pub max_pending_bytes: Option<usize>,
+    pub fail_fast_on_disconnect: Option<bool>,
 }
 #[pymethods]
 impl ConfigOptions {
     #[new]
-    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None, max_pending_commands=None))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None, max_pending_commands=None, max_pending_bytes=None, fail_fast_on_disconnect=None))]
     fn new(
         queue_name: String,
         rpc_exchange_name: String,
@@ -282,6 +294,8 @@ impl ConfigOptions {
         dead_letter_routing_key: Option<String>,
         batch_config: Option<BatchConfig>,
         max_pending_commands: Option<usize>,
+        max_pending_bytes: Option<usize>,
+        fail_fast_on_disconnect: Option<bool>,
     ) -> Self {
         Self {
             queue_name,
@@ -291,6 +305,8 @@ impl ConfigOptions {
             dead_letter_routing_key,
             batch_config,
             max_pending_commands,
+            max_pending_bytes,
+            fail_fast_on_disconnect,
         }
     }
 }
@@ -303,6 +319,10 @@ impl From<ConfigOptions> for RuConfigOptions {
             dead_letter_exchange: options.dead_letter_exchange,
             dead_letter_routing_key: options.dead_letter_routing_key,
             max_pending_commands: options.max_pending_commands.unwrap_or(10_000),
+            max_pending_bytes: options.max_pending_bytes.unwrap_or(64 * 1024 * 1024),
+            fail_fast_on_disconnect: options.fail_fast_on_disconnect.unwrap_or(false),
+            default_command_timeout: std::time::Duration::from_secs(16),
+            max_reconnect_delay: 30,
         }
     }
 }
@@ -411,9 +431,26 @@ pub struct QoSConfig {
     pub rpc_server_prefetch: Option<u16>,
     pub rpc_client_prefetch: Option<u16>,
 }
+impl Default for QoSConfig {
+    fn default() -> Self {
+        Self {
+            pub_confirm: true,
+            rpc_client_confirm: true,
+            rpc_server_confirm: false,
+            sub_auto_ack: false,
+            rpc_server_auto_ack: false,
+            rpc_client_auto_ack: false,
+            sub_prefetch: None,
+            rpc_server_prefetch: None,
+            rpc_client_prefetch: None,
+        }
+    }
+}
+
 #[pymethods]
 impl QoSConfig {
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (pub_confirm=true, rpc_client_confirm=true, rpc_server_confirm=false, sub_auto_ack=false, rpc_server_auto_ack=false, rpc_client_auto_ack=false, sub_prefetch=None, rpc_server_prefetch=None, rpc_client_prefetch=None))]
     fn new(
         pub_confirm: bool,
@@ -440,18 +477,9 @@ impl QoSConfig {
     }
 
     #[staticmethod]
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
-        Self {
-            pub_confirm: true,
-            rpc_client_confirm: true,
-            rpc_server_confirm: false,
-            sub_auto_ack: false,
-            rpc_server_auto_ack: false,
-            rpc_client_auto_ack: false,
-            sub_prefetch: None,
-            rpc_server_prefetch: None,
-            rpc_client_prefetch: None,
-        }
+        Default::default()
     }
 }
 impl From<QoSConfig> for RuQoSConfig {

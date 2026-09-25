@@ -6,6 +6,7 @@ use amqp_client_rust::{
     eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
     utils::{
       ContentEncoding as RuContentEncoding, DeliveryMode as RuDeliveryMode, Message as RuMessage,
+      PublishOptions as RuPublishOptions, RpcClientOptions as RuRpcClientOptions,
     },
   },
   domain::config::{
@@ -47,9 +48,9 @@ pub enum ContentEncoding {
   Null,
 }
 
-impl Into<RuContentEncoding> for ContentEncoding {
-  fn into(self) -> RuContentEncoding {
-    match self {
+impl From<ContentEncoding> for RuContentEncoding {
+  fn from(val: ContentEncoding) -> Self {
+    match val {
       ContentEncoding::Zstd => RuContentEncoding::Zstd,
       ContentEncoding::Lz4 => RuContentEncoding::Lz4,
       ContentEncoding::Zlib => RuContentEncoding::Zlib,
@@ -91,6 +92,8 @@ pub struct ConfigOptions {
   pub dead_letter_exchange: Option<String>,
   pub dead_letter_routing_key: Option<String>,
   pub max_pending_commands: Option<u32>,
+  pub max_pending_bytes: Option<u32>,
+  pub fail_fast_on_disconnect: Option<bool>,
 }
 
 impl From<ConfigOptions> for RuConfigOptions {
@@ -102,6 +105,10 @@ impl From<ConfigOptions> for RuConfigOptions {
       dead_letter_exchange: options.dead_letter_exchange,
       dead_letter_routing_key: options.dead_letter_routing_key,
       max_pending_commands: options.max_pending_commands.map(|v| v as usize).unwrap_or(10_000),
+      max_pending_bytes: options.max_pending_bytes.map(|v| v as usize).unwrap_or(64 * 1024 * 1024),
+      fail_fast_on_disconnect: options.fail_fast_on_disconnect.unwrap_or(false),
+      default_command_timeout: std::time::Duration::from_secs(16),
+      max_reconnect_delay: 30,
     }
   }
 }
@@ -262,6 +269,7 @@ impl AsyncEventbus {
   }
 
   #[napi]
+  #[allow(clippy::too_many_arguments)]
   pub async fn publish(
     &self,
     exchange_name: String,
@@ -278,7 +286,15 @@ impl AsyncEventbus {
       Either::B(s) => s.into_bytes(),
     };
 
-    let command_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+    let cmd_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+
+    let pub_opts = RuPublishOptions {
+      content_type: content_type.as_deref().unwrap_or("application/json"),
+      content_encoding: content_encoding.into(),
+      command_timeout: cmd_timeout,
+      delivery_mode: delivery_mode.into(),
+      expiration,
+    };
 
     self
       .eventbus
@@ -286,19 +302,16 @@ impl AsyncEventbus {
         &exchange_name,
         &routing_key,
         payload_bytes,
-        content_type.as_deref(),
-        content_encoding.into(),
-        command_timeout,
-        Some(delivery_mode.into()),
-        expiration,
+        &pub_opts,
       )
       .await
-      .map_err(|e| AppError::from(e))?;
+      .map_err(AppError::from)?;
 
     Ok(())
   }
 
   #[napi]
+  #[allow(clippy::too_many_arguments)]
   pub async fn rpc_client(
     &self,
     exchange_name: String,
@@ -318,21 +331,25 @@ impl AsyncEventbus {
 
     let conn_timeout = connection_timeout.map(|t| std::time::Duration::from_secs(t as u64));
 
+    let rpc_opts = RuRpcClientOptions {
+      content_type: &content_type,
+      content_encoding: content_encoding.into(),
+      response_timeout_millis: response_timeout,
+      command_timeout: conn_timeout,
+      delivery_mode: delivery_mode.into(),
+      expiration,
+    };
+
     let res = self
       .eventbus
       .rpc_client(
         &exchange_name,
         &routing_key,
         payload_bytes,
-        &content_type,
-        content_encoding.into(),
-        response_timeout,
-        conn_timeout,
-        Some(delivery_mode.into()),
-        expiration,
+        &rpc_opts,
       )
       .await
-      .map_err(|e| AppError::from(e))?;
+      .map_err(AppError::from)?;
 
     Ok(res.into())
   }
@@ -366,8 +383,7 @@ impl AsyncEventbus {
             if status == napi::Status::Ok {
               Ok(())
             } else {
-              Err(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
+              Err(Box::new(std::io::Error::other(
                 format!("ThreadsafeFunction call failed with status: {:?}", status),
               )) as Box<dyn std::error::Error + Send + Sync>)
             }
@@ -377,7 +393,7 @@ impl AsyncEventbus {
         command_timeout,
       )
       .await
-      .map_err(|e| AppError::from(e))?;
+      .map_err(AppError::from)?;
 
     Ok(())
   }
@@ -414,7 +430,7 @@ impl AsyncEventbus {
         command_timeout,
       )
       .await
-      .map_err(|e| AppError::from(e))?;
+      .map_err(AppError::from)?;
 
     Ok(())
   }

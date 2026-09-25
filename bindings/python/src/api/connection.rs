@@ -6,7 +6,10 @@ use crate::{
 };
 use amqp_client_rust::api::{
     connection::AsyncConnection as RuAsyncConnection,
-    utils::{Message as RuMessage, QueueOptions as RuQueueOptions},
+    utils::{
+        Message as RuMessage, PublishOptions as RuPublishOptions, QueueOptions as RuQueueOptions,
+        RpcClientOptions as RuRpcClientOptions, RouteBinding as RuRouteBinding,
+    },
 };
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::{pin::Pin, sync::Arc};
@@ -39,6 +42,7 @@ impl AsyncConnection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn publish<'py>(
         slf: PyRef<'py, Self>,
         exchange_name: &str,
@@ -64,21 +68,25 @@ impl AsyncConnection {
         let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pub_opts = RuPublishOptions {
+                content_type: &content_type,
+                content_encoding: content_encoding.into(),
+                command_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
             conn.publish(
                 &exchange_name,
                 &routing_key,
                 payload_bytes,
-                &content_type,
-                content_encoding.into(),
-                command_timeout,
-                delivery_mode.into(),
-                expiration,
+                &pub_opts,
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("Failed to publish message: {}", e)))
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn subscribe<'py>(
         slf: PyRef<'py, Self>,
         handler: Py<PyAny>,
@@ -126,14 +134,12 @@ impl AsyncConnection {
                     match future_result {
                         Ok(py_future) => match py_future.await {
                             Ok(_) => Ok(()),
-                            Err(e) => Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            Err(e) => Err(Box::new(std::io::Error::other(
                                 e.to_string(),
                             ))
                                 as Box<dyn std::error::Error + Send + Sync>),
                         },
-                        Err(e) => Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        Err(e) => Err(Box::new(std::io::Error::other(
                             format!("Failed to execute Python callback: {}", e),
                         ))
                             as Box<dyn std::error::Error + Send + Sync>),
@@ -153,13 +159,16 @@ impl AsyncConnection {
         });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let binding = RuRouteBinding {
+                routing_key: &routing_key,
+                exchange_name: &exchange_name,
+                exchange_type: &exchange_type,
+                queue_name: &queue_name,
+            };
             match conn
                 .subscribe(
                     handler,
-                    &routing_key,
-                    &exchange_name,
-                    &exchange_type,
-                    &queue_name,
+                    binding,
                     process_timeout,
                     command_timeout,
                     queue_options,
@@ -172,6 +181,7 @@ impl AsyncConnection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rpc_server<'py>(
         slf: PyRef<'py, Self>,
         handler: Py<PyAny>,
@@ -216,8 +226,7 @@ impl AsyncConnection {
                     }) {
                         Some(res) => res,
                         None => {
-                            return Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            return Err(Box::new(std::io::Error::other(
                                 "Python runtime is finalizing or unavailable",
                             ))
                                 as Box<dyn std::error::Error + Send + Sync>);
@@ -243,21 +252,18 @@ impl AsyncConnection {
                                     }
                                 }) {
                                     Some(res) => res,
-                                    None => Err(Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
+                                    None => Err(Box::new(std::io::Error::other(
                                         "Python runtime is finalizing or unavailable",
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>),
                                 }
                             }
-                            Err(e) => Err(Box::new(std::io::Error::new(
-                                std::io::ErrorKind::Other,
+                            Err(e) => Err(Box::new(std::io::Error::other(
                                 e.to_string(),
                             ))
                                 as Box<dyn std::error::Error + Send + Sync>),
                         },
-                        Err(e) => Err(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
+                        Err(e) => Err(Box::new(std::io::Error::other(
                             format!("Failed to execute Python callback: {}", e),
                         ))
                             as Box<dyn std::error::Error + Send + Sync>),
@@ -281,13 +287,16 @@ impl AsyncConnection {
         });
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let binding = RuRouteBinding {
+                routing_key: &routing_key,
+                exchange_name: &exchange_name,
+                exchange_type: &exchange_type,
+                queue_name: &queue_name,
+            };
             match conn
                 .rpc_server(
                     handler,
-                    &routing_key,
-                    &exchange_name,
-                    &exchange_type,
-                    &queue_name,
+                    binding,
                     process_timeout,
                     command_timeout,
                     queue_options,
@@ -300,6 +309,7 @@ impl AsyncConnection {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn rpc_client<'py>(
         slf: PyRef<'py, Self>,
         exchange_name: &str,
@@ -326,16 +336,19 @@ impl AsyncConnection {
         let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rpc_opts = RuRpcClientOptions {
+                content_type: &content_type,
+                content_encoding: content_encoding.into(),
+                response_timeout_millis,
+                command_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
             conn.rpc_client(
                 &exchange_name,
                 &routing_key,
                 payload_bytes,
-                &content_type,
-                content_encoding.into(),
-                response_timeout_millis,
-                command_timeout,
-                delivery_mode.into(),
-                expiration,
+                &rpc_opts,
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("Failed to execute RPC request: {}", e)))

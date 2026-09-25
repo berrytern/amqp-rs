@@ -18,8 +18,7 @@ pub fn install_crypto_provider() -> std::io::Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
+            std::io::Error::other(
                 "Error on install crypto provider for tls",
             )
         })?;
