@@ -22,10 +22,10 @@ use crate::{
 };
 
 struct BatchItem {
-    exchange: Option<Arc<str>>,
+    exchange: Arc<str>,
     routing_key: Arc<str>,
     payload: Vec<u8>,
-    content_type: Option<Arc<str>>,
+    content_type: Arc<str>,
     content_encoding: ContentEncoding,
     command_timeout: Option<std::time::Duration>,
     delivery_mode: DeliveryMode,
@@ -72,37 +72,6 @@ pub fn init_tokio(worker_threads: Option<usize>) -> PyResult<()> {
     let _ = pyo3_async_runtimes::tokio::get_runtime();
     TOKIO_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
     Ok(())
-}
-
-static DISPATCH_CONCURRENT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-static DISPATCH_BULK: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
-
-fn get_dispatch_concurrent(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let py_any = DISPATCH_CONCURRENT.get_or_init(|| {
-        let code = c"import asyncio\nimport inspect\n\nasync def _dispatch_concurrent(handler, items):\n    async def _run_one(msg, ack):\n        try:\n            res = handler(msg)\n            if inspect.isawaitable(res):\n                await res\n            ack.ack()\n        except Exception as e:\n            ack.nack(str(e))\n    await asyncio.gather(*(_run_one(msg, ack) for msg, ack in items))\n";
-        let module = pyo3::types::PyModule::from_code(
-            py,
-            code,
-            c"amqp_rs._dispatcher",
-            c"amqp_rs._dispatcher",
-        ).expect("failed to compile dispatcher module");
-        module.getattr("_dispatch_concurrent").expect("failed to get _dispatch_concurrent").unbind()
-    });
-    Ok(py_any.bind(py).clone())
-}
-
-fn get_dispatch_bulk(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let py_any = DISPATCH_BULK.get_or_init(|| {
-        let code = c"import asyncio\nimport inspect\n\nasync def _dispatch_bulk(handler, messages, acks):\n    try:\n        res = handler(messages)\n        if inspect.isawaitable(res):\n            await res\n        for ack in acks:\n            ack.ack()\n    except Exception as e:\n        err_msg = str(e)\n        for ack in acks:\n            ack.nack(err_msg)\n";
-        let module = pyo3::types::PyModule::from_code(
-            py,
-            code,
-            c"amqp_rs._dispatcher_bulk",
-            c"amqp_rs._dispatcher_bulk",
-        ).expect("failed to compile dispatcher bulk module");
-        module.getattr("_dispatch_bulk").expect("failed to get _dispatch_bulk").unbind()
-    });
-    Ok(py_any.bind(py).clone())
 }
 
 #[pyclass(from_py_object)]
@@ -164,14 +133,14 @@ impl AsyncEventbus {
                         let b = Arc::clone(&bus);
                         tokio::spawn(async move {
                             let pub_opts = RuPublishOptions {
-                                content_type: item.content_type.as_deref().unwrap_or("application/json"),
+                                content_type: &item.content_type,
                                 content_encoding: item.content_encoding.into(),
                                 command_timeout: item.command_timeout,
                                 delivery_mode: item.delivery_mode.into(),
                                 expiration: item.expiration,
                             };
                             let res = b.publish(
-                                item.exchange.as_deref().unwrap_or(""),
+                                &item.exchange,
                                 &item.routing_key,
                                 item.payload,
                                 &pub_opts,
@@ -199,11 +168,6 @@ impl AsyncEventbus {
     #[inline]
     pub fn inner(&self) -> Arc<RuAsyncEventbusRabbitMQ> {
         Arc::clone(&self.eventbus)
-    }
-
-    #[inline]
-    fn intern_string(&self, s: &str) -> Arc<str> {
-        Arc::from(s)
     }
 }
 
@@ -273,16 +237,9 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let ex = if exchange_name.is_empty() {
-            None
-        } else {
-            Some(slf.intern_string(exchange_name))
-        };
-        let rk = slf.intern_string(routing_key);
-        let ct = match content_type {
-            Some("application/json") | None => None,
-            Some(s) => Some(slf.intern_string(s)),
-        };
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let content_type: Arc<str> = Arc::from(content_type.unwrap_or("application/json"));
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
@@ -293,10 +250,10 @@ impl AsyncEventbus {
             if payload_bytes.len() <= slf.batch_config.max_payload_bytes {
                 let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
                 let item = BatchItem {
-                    exchange: ex,
-                    routing_key: rk,
+                    exchange: exchange_name,
+                    routing_key,
                     payload: payload_bytes,
-                    content_type: ct,
+                    content_type,
                     content_encoding,
                     command_timeout: cmd_timeout,
                     delivery_mode,
@@ -325,7 +282,7 @@ impl AsyncEventbus {
         let content_encoding = content_encoding.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let pub_opts = RuPublishOptions {
-                content_type: ct.as_deref().unwrap_or("application/json"),
+                content_type: &content_type,
                 content_encoding: content_encoding.into(),
                 command_timeout: cmd_timeout,
                 delivery_mode: delivery_mode.into(),
@@ -333,8 +290,8 @@ impl AsyncEventbus {
             };
             match eventbus
                 .publish(
-                    ex.as_deref().unwrap_or(""),
-                    &rk,
+                    &exchange_name,
+                    &routing_key,
                     payload_bytes,
                     &pub_opts,
                 )
@@ -361,16 +318,9 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let ex = if exchange_name.is_empty() {
-            None
-        } else {
-            Some(slf.intern_string(exchange_name))
-        };
-        let rk = slf.intern_string(routing_key);
-        let ct = match content_type {
-            Some("application/json") | None => None,
-            Some(s) => Some(slf.intern_string(s)),
-        };
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let content_type: Arc<str> = Arc::from(content_type.unwrap_or("application/json"));
         let content_encoding = content_encoding.clone();
 
         let mut payloads = Vec::with_capacity(messages.len());
@@ -387,21 +337,21 @@ impl AsyncEventbus {
             let mut tasks = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 let bus = Arc::clone(&eventbus);
-                let ex = ex.clone();
-                let rk = Arc::clone(&rk);
-                let ct = ct.clone();
+                let ex = Arc::clone(&exchange_name);
+                let rk = Arc::clone(&routing_key);
+                let ct = Arc::clone(&content_type);
                 let ce = content_encoding.clone();
                 let dm = delivery_mode.clone();
                 tasks.push(tokio::spawn(async move {
                     let pub_opts = RuPublishOptions {
-                        content_type: ct.as_deref().unwrap_or("application/json"),
+                        content_type: &ct,
                         content_encoding: ce.into(),
                         command_timeout,
                         delivery_mode: dm.into(),
                         expiration: None,
                     };
                     bus.publish(
-                        ex.as_deref().unwrap_or(""),
+                        &ex,
                         &rk,
                         payload,
                         &pub_opts,
@@ -436,17 +386,9 @@ impl AsyncEventbus {
     ) -> PyResult<Bound<'py, PyAny>> {
         let eventbus = Arc::clone(&slf.eventbus);
 
-        let ex = if exchange_name.is_empty() {
-            None
-        } else {
-            Some(slf.intern_string(exchange_name))
-        };
-        let rk = slf.intern_string(routing_key);
-        let ct = if content_type == "application/json" {
-            None
-        } else {
-            Some(slf.intern_string(content_type))
-        };
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let content_type: Arc<str> = Arc::from(content_type);
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
@@ -454,11 +396,9 @@ impl AsyncEventbus {
         let content_encoding = content_encoding.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
-            let ex_ref = ex.as_deref().unwrap_or("");
-            let ct_ref = ct.as_deref().unwrap_or("application/json");
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
             let rpc_opts = RuRpcClientOptions {
-                content_type: ct_ref,
+                content_type: &content_type,
                 content_encoding: content_encoding.into(),
                 response_timeout_millis: response_timeout,
                 command_timeout: conn_timeout,
@@ -467,8 +407,8 @@ impl AsyncEventbus {
             };
             match eventbus
                 .rpc_client(
-                    ex_ref,
-                    &rk,
+                    &exchange_name,
+                    &routing_key,
                     payload_bytes,
                     &rpc_opts,
                 )
@@ -540,43 +480,48 @@ impl AsyncEventbus {
                         }
 
                         let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch_size));
-                        let handler = handler_clone.clone();
-                        let locals = locals_clone.clone();
-
-                        pyo3_async_runtimes::tokio::scope(locals, async move {
-                            let future_result = match Python::try_attach(|py| -> PyResult<_> {
-                                let bound_handler = handler.bind(py);
-                                let py_items = pyo3::types::PyList::empty(py);
-
-                                for item in current_batch {
-                                    let ack = DeliveryAck {
-                                        ack_tx: Arc::new(std::sync::Mutex::new(Some(item.ack_tx))),
-                                    };
-                                    let msg = Message::from(item.message);
-                                    py_items.append((msg, ack))?;
-                                }
-
-                                let dispatcher = get_dispatch_concurrent(py)?;
-                                let coro = dispatcher.call1((bound_handler, py_items))?;
-
-                                match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
-                                    Ok(fut) => Ok(fut),
-                                    Err(e) => {
-                                        if let Ok(close_fn) = coro.getattr(pyo3::intern!(py, "close")) {
-                                            let _ = close_fn.call0();
+                        for item in current_batch {
+                            let item_handler = handler_clone.clone();
+                            let item_locals = locals_clone.clone();
+                            tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
+                                let msg = Message::from(item.message);
+                                let py_future_res = Python::try_attach(|py| -> PyResult<_> {
+                                    let bound_handler = item_handler.bind(py);
+                                    let res = bound_handler.call1((msg,))?;
+                                    match pyo3_async_runtimes::tokio::into_future(res.clone()) {
+                                        Ok(fut) => Ok(Some(fut)),
+                                        Err(e) => {
+                                            if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
+                                                let _ = close_fn.call0();
+                                                Err(e)
+                                            } else {
+                                                Ok(None)
+                                            }
                                         }
-                                        Err(e)
+                                    }
+                                });
+
+                                match py_future_res {
+                                    Some(Ok(Some(fut))) => match fut.await {
+                                        Ok(_) => {
+                                            let _ = item.ack_tx.send(Ok(()));
+                                        }
+                                        Err(e) => {
+                                            let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other(e.to_string()))));
+                                        }
+                                    },
+                                    Some(Ok(None)) => {
+                                        let _ = item.ack_tx.send(Ok(()));
+                                    }
+                                    Some(Err(e)) => {
+                                        let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e)))));
+                                    }
+                                    None => {
+                                        let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other("Python runtime is finalizing or unavailable"))));
                                     }
                                 }
-                            }) {
-                                Some(res) => res,
-                                None => return,
-                            };
-
-                            if let Ok(py_future) = future_result {
-                                let _ = py_future.await;
-                            }
-                        }).await;
+                            }));
+                        }
                     }
                 });
 
@@ -716,45 +661,63 @@ impl AsyncEventbus {
                     }
 
                     let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
-                    let handler = handler_clone.clone();
-                    let locals = locals_clone.clone();
+                    let item_handler = handler_clone.clone();
+                    let item_locals = locals_clone.clone();
+                    let (messages, ack_txs): (Vec<Message>, Vec<_>) = current_batch
+                        .into_iter()
+                        .map(|item| (Message::from(item.message), item.ack_tx))
+                        .unzip();
 
-                    pyo3_async_runtimes::tokio::scope(locals, async move {
-                        let future_result = match Python::try_attach(|py| -> PyResult<_> {
-                            let bound_handler = handler.bind(py);
-                            let py_messages = pyo3::types::PyList::empty(py);
-                            let py_acks = pyo3::types::PyList::empty(py);
-
-                            for item in current_batch {
-                                let ack = DeliveryAck {
-                                    ack_tx: Arc::new(std::sync::Mutex::new(Some(item.ack_tx))),
-                                };
-                                let msg = Message::from(item.message);
-                                py_messages.append(msg)?;
-                                py_acks.append(ack)?;
-                            }
-
-                            let dispatcher = get_dispatch_bulk(py)?;
-                            let coro = dispatcher.call1((bound_handler, py_messages, py_acks))?;
-
-                            match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
-                                Ok(fut) => Ok(fut),
+                    tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
+                        let py_future_res = Python::try_attach(|py| -> PyResult<_> {
+                            let py_messages = pyo3::types::PyList::new(py, messages)?;
+                            let bound_handler = item_handler.bind(py);
+                            let res = bound_handler.call1((py_messages,))?;
+                            match pyo3_async_runtimes::tokio::into_future(res.clone()) {
+                                Ok(fut) => Ok(Some(fut)),
                                 Err(e) => {
-                                    if let Ok(close_fn) = coro.getattr(pyo3::intern!(py, "close")) {
+                                    if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
                                         let _ = close_fn.call0();
+                                        Err(e)
+                                    } else {
+                                        Ok(None)
                                     }
-                                    Err(e)
                                 }
                             }
-                        }) {
-                            Some(res) => res,
-                            None => return,
-                        };
+                        });
 
-                        if let Ok(py_future) = future_result {
-                            let _ = py_future.await;
+                        match py_future_res {
+                            Some(Ok(Some(fut))) => match fut.await {
+                                Ok(_) => {
+                                    for tx in ack_txs {
+                                        let _ = tx.send(Ok(()));
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    for tx in ack_txs {
+                                        let _ = tx.send(Err(Box::new(std::io::Error::other(err_msg.clone()))));
+                                    }
+                                }
+                            },
+                            Some(Ok(None)) => {
+                                for tx in ack_txs {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let err_msg = format!("Failed to execute Python callback: {}", e);
+                                for tx in ack_txs {
+                                    let _ = tx.send(Err(Box::new(std::io::Error::other(err_msg.clone()))));
+                                }
+                            }
+                            None => {
+                                for tx in ack_txs {
+                                    let _ = tx.send(Err(Box::new(std::io::Error::other("Python runtime is finalizing or unavailable"))));
+                                }
+                            }
                         }
-                    }).await;
+                    }));
                 }
             });
 
@@ -893,17 +856,14 @@ impl AsyncEventbus {
         })
     }
     fn dispose(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyAny>> {
-        let eventbus = Arc::clone(&slf.eventbus); // Clone the Arc for the async move
+        let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            tokio::task::spawn_blocking(move || {
-                tokio::runtime::Handle::current()
-                    .block_on(async move { eventbus.dispose().await })
-                    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
-            })
-            .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?
+            eventbus
+                .dispose()
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 }

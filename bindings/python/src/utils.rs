@@ -238,32 +238,36 @@ impl BatchConfig {
 
 type AckSender = tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>;
 
+pub struct AckInner {
+    pub tx: std::sync::Mutex<Option<AckSender>>,
+}
+
+impl Drop for AckInner {
+    fn drop(&mut self) {
+        if let Some(tx) = self.tx.lock().ok().and_then(|mut g| g.take()) {
+            let _ = tx.send(Err(Box::new(std::io::Error::other("Delivery dropped without ACK/NACK"))));
+        }
+    }
+}
+
 #[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct DeliveryAck {
-    pub ack_tx: Arc<std::sync::Mutex<Option<AckSender>>>,
+    pub inner: Arc<AckInner>,
 }
 
 #[pymethods]
 impl DeliveryAck {
     pub fn ack(&self) {
-        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(tx) = self.inner.tx.lock().ok().and_then(|mut g| g.take()) {
             let _ = tx.send(Ok(()));
         }
     }
 
     pub fn nack(&self, err: Option<String>) {
-        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(tx) = self.inner.tx.lock().ok().and_then(|mut g| g.take()) {
             let msg = err.unwrap_or_else(|| "Delivery nacked by subscriber".to_string());
             let _ = tx.send(Err(Box::new(std::io::Error::other(msg))));
-        }
-    }
-}
-
-impl Drop for DeliveryAck {
-    fn drop(&mut self) {
-        if let Some(tx) = self.ack_tx.lock().ok().and_then(|mut g| g.take()) {
-            let _ = tx.send(Err(Box::new(std::io::Error::other("Delivery dropped without ACK/NACK"))));
         }
     }
 }

@@ -437,18 +437,10 @@ impl AsyncEventbus {
 
   #[napi]
   pub async fn dispose(&self) -> Result<()> {
-    let eventbus = self.eventbus.clone();
-    tokio::task::spawn_blocking(move || {
-      tokio::runtime::Handle::current()
-        .block_on(async move { eventbus.dispose().await.map_err(|e| e.to_string()) })
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
-    .map_err(|_| {
-      Error::new(
-        Status::GenericFailure,
-        "Unexpected Result Error during dispose",
-      )
-    })
+    self
+      .eventbus
+      .dispose()
+      .await
+      .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
   }
 }

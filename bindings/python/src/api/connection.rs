@@ -61,9 +61,6 @@ impl AsyncConnection {
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
         };
         let content_type = content_type.to_owned();
-        let content_encoding = content_encoding.to_owned();
-        let delivery_mode = delivery_mode.to_owned();
-        let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let pub_opts = RuPublishOptions {
@@ -329,9 +326,6 @@ impl AsyncConnection {
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
         };
         let content_type = content_type.to_owned();
-        let content_encoding = content_encoding.to_owned();
-        let delivery_mode = delivery_mode.to_owned();
-        let expiration = expiration.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let rpc_opts = RuRpcClientOptions {
