@@ -28,9 +28,7 @@ impl AsyncConnection {
         auto_ack: bool,
         prefetch_count: Option<u16>,
     ) -> PyResult<Self> {
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-
-        let _guard = rt.enter();
+        let _guard = crate::enter_active_runtime();
         let connection = RuAsyncConnection::new(
             Arc::new(config.into()),
             publish_confirmations.into(),

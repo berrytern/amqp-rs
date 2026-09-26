@@ -3,6 +3,9 @@ from concurrent.futures import Future
 from enum import Enum
 
 
+def init_tokio(worker_threads: Optional[int] = None) -> None: ...
+
+
 class Message:
     body: bytes
     content_type: Optional[str]

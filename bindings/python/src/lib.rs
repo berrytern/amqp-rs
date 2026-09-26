@@ -22,7 +22,7 @@ use crate::{
 };
 
 struct BatchItem {
-    exchange: Arc<str>,
+    exchange: Option<Arc<str>>,
     routing_key: Arc<str>,
     payload: Vec<u8>,
     content_type: Option<Arc<str>>,
@@ -36,6 +36,42 @@ struct BatchItem {
 struct SubItem {
     message: RuMessage,
     ack_tx: tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+}
+
+static TOKIO_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn enter_active_runtime() -> Option<tokio::runtime::EnterGuard<'static>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        None
+    } else {
+        TOKIO_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+        Some(pyo3_async_runtimes::tokio::get_runtime().enter())
+    }
+}
+
+#[pyfunction]
+#[pyo3(signature = (worker_threads=None))]
+pub fn init_tokio(worker_threads: Option<usize>) -> PyResult<()> {
+    if TOKIO_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Tokio runtime has already been initialized",
+        ));
+    }
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    if let Some(threads) = worker_threads {
+        if threads == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker_threads must be greater than 0",
+            ));
+        }
+        builder.worker_threads(threads);
+    }
+    pyo3_async_runtimes::tokio::init(builder);
+    let _ = pyo3_async_runtimes::tokio::get_runtime();
+    TOKIO_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 static DISPATCH_CONCURRENT: std::sync::OnceLock<Py<PyAny>> = std::sync::OnceLock::new();
@@ -88,6 +124,7 @@ impl AsyncEventbus {
         });
 
         let batch_sender = if resolved_batch_config.enabled {
+            let _guard = enter_active_runtime();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BatchItem>();
             let bus = Arc::clone(&eventbus);
             let max_batch_size = resolved_batch_config.max_batch_size;
@@ -134,7 +171,7 @@ impl AsyncEventbus {
                                 expiration: item.expiration,
                             };
                             let res = b.publish(
-                                &item.exchange,
+                                item.exchange.as_deref().unwrap_or(""),
                                 &item.routing_key,
                                 item.payload,
                                 &pub_opts,
@@ -205,8 +242,7 @@ impl AsyncEventbus {
             }
         };
 
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
-        let _guard = rt.enter();
+        let _guard = enter_active_runtime();
 
         let eventbus = Arc::new(RuAsyncEventbusRabbitMQ::new(
             config.into(),
@@ -237,9 +273,16 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let ex = slf.intern_string(exchange_name);
+        let ex = if exchange_name.is_empty() {
+            None
+        } else {
+            Some(slf.intern_string(exchange_name))
+        };
         let rk = slf.intern_string(routing_key);
-        let ct = content_type.map(|s| slf.intern_string(s));
+        let ct = match content_type {
+            Some("application/json") | None => None,
+            Some(s) => Some(slf.intern_string(s)),
+        };
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
@@ -290,7 +333,7 @@ impl AsyncEventbus {
             };
             match eventbus
                 .publish(
-                    &ex,
+                    ex.as_deref().unwrap_or(""),
                     &rk,
                     payload_bytes,
                     &pub_opts,
@@ -318,9 +361,16 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let ex = slf.intern_string(exchange_name);
+        let ex = if exchange_name.is_empty() {
+            None
+        } else {
+            Some(slf.intern_string(exchange_name))
+        };
         let rk = slf.intern_string(routing_key);
-        let ct = content_type.map(|s| slf.intern_string(s));
+        let ct = match content_type {
+            Some("application/json") | None => None,
+            Some(s) => Some(slf.intern_string(s)),
+        };
         let content_encoding = content_encoding.clone();
 
         let mut payloads = Vec::with_capacity(messages.len());
@@ -337,7 +387,7 @@ impl AsyncEventbus {
             let mut tasks = Vec::with_capacity(payloads.len());
             for payload in payloads {
                 let bus = Arc::clone(&eventbus);
-                let ex = Arc::clone(&ex);
+                let ex = ex.clone();
                 let rk = Arc::clone(&rk);
                 let ct = ct.clone();
                 let ce = content_encoding.clone();
@@ -351,7 +401,7 @@ impl AsyncEventbus {
                         expiration: None,
                     };
                     bus.publish(
-                        &ex,
+                        ex.as_deref().unwrap_or(""),
                         &rk,
                         payload,
                         &pub_opts,
@@ -386,9 +436,17 @@ impl AsyncEventbus {
     ) -> PyResult<Bound<'py, PyAny>> {
         let eventbus = Arc::clone(&slf.eventbus);
 
-        let ex = slf.intern_string(exchange_name);
+        let ex = if exchange_name.is_empty() {
+            None
+        } else {
+            Some(slf.intern_string(exchange_name))
+        };
         let rk = slf.intern_string(routing_key);
-        let ct = slf.intern_string(content_type);
+        let ct = if content_type == "application/json" {
+            None
+        } else {
+            Some(slf.intern_string(content_type))
+        };
         let payload_bytes = match body {
             Payload::Bytes(b) => b.as_bytes().to_vec(),
             Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
@@ -396,9 +454,11 @@ impl AsyncEventbus {
         let content_encoding = content_encoding.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
+            let ex_ref = ex.as_deref().unwrap_or("");
+            let ct_ref = ct.as_deref().unwrap_or("application/json");
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
             let rpc_opts = RuRpcClientOptions {
-                content_type: &ct,
+                content_type: ct_ref,
                 content_encoding: content_encoding.into(),
                 response_timeout_millis: response_timeout,
                 command_timeout: conn_timeout,
@@ -407,7 +467,7 @@ impl AsyncEventbus {
             };
             match eventbus
                 .rpc_client(
-                    &ex,
+                    ex_ref,
                     &rk,
                     payload_bytes,
                     &rpc_opts,
@@ -850,6 +910,17 @@ impl AsyncEventbus {
 
 #[pymodule]
 fn amqp_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    if let Ok(val) = std::env::var("TOKIO_WORKER_THREADS")
+        && let Ok(threads) = val.parse::<usize>()
+        && threads > 0
+    {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        builder.worker_threads(threads);
+        pyo3_async_runtimes::tokio::init(builder);
+    }
+
+    m.add_function(wrap_pyfunction!(init_tokio, m)?)?;
     m.add_class::<AsyncEventbus>()?;
     m.add_class::<AsyncConnection>()?;
     m.add_class::<Config>()?;
