@@ -55,7 +55,8 @@ Source = "https://github.com/berrytern/amqp-rs"
 [dependency-groups]
 dev = [
     "maturin[patchelf,zig]>=1.11.5",
-    "amqp-client-python>=0.2.0",
+    "amqp-client-python==0.2.2 ; python_version >= '3.10'",
+    "amqp-client-python>=0.2.0 ; python_version < '3.10'",
     "pytest>=8.3.5",
     "pytest-asyncio>=0.24.0",
     "uvloop>=0.21.0",

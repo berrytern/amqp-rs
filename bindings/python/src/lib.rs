@@ -480,48 +480,55 @@ impl AsyncEventbus {
                         }
 
                         let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch_size));
-                        for item in current_batch {
-                            let item_handler = handler_clone.clone();
-                            let item_locals = locals_clone.clone();
-                            tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
-                                let msg = Message::from(item.message);
-                                let py_future_res = Python::try_attach(|py| -> PyResult<_> {
-                                    let bound_handler = item_handler.bind(py);
-                                    let res = bound_handler.call1((msg,))?;
-                                    match pyo3_async_runtimes::tokio::into_future(res.clone()) {
-                                        Ok(fut) => Ok(Some(fut)),
-                                        Err(e) => {
-                                            if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
-                                                let _ = close_fn.call0();
-                                                Err(e)
-                                            } else {
-                                                Ok(None)
-                                            }
-                                        }
-                                    }
-                                });
+                        let item_handler = handler_clone.clone();
+                        let item_locals = locals_clone.clone();
 
-                                match py_future_res {
-                                    Some(Ok(Some(fut))) => match fut.await {
-                                        Ok(_) => {
-                                            let _ = item.ack_tx.send(Ok(()));
-                                        }
+                        tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
+                            let mut tasks = Vec::with_capacity(current_batch.len());
+                            let attach_opt = Python::try_attach(|py| {
+                                let bound_handler = item_handler.bind(py);
+                                for item in current_batch {
+                                    let msg = Message::from(item.message);
+                                    match bound_handler.call1((msg,)) {
+                                        Ok(res) => match pyo3_async_runtimes::tokio::into_future(res.clone()) {
+                                            Ok(fut) => tasks.push((Ok(Some(fut)), item.ack_tx)),
+                                            Err(_) => {
+                                                if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
+                                                    let _ = close_fn.call0();
+                                                }
+                                                tasks.push((Ok(None), item.ack_tx));
+                                            }
+                                        },
                                         Err(e) => {
-                                            let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other(e.to_string()))));
+                                            tasks.push((Err(e.to_string()), item.ack_tx));
                                         }
-                                    },
-                                    Some(Ok(None)) => {
-                                        let _ = item.ack_tx.send(Ok(()));
-                                    }
-                                    Some(Err(e)) => {
-                                        let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e)))));
-                                    }
-                                    None => {
-                                        let _ = item.ack_tx.send(Err(Box::new(std::io::Error::other("Python runtime is finalizing or unavailable"))));
                                     }
                                 }
-                            }));
-                        }
+                            });
+
+                            if attach_opt.is_none() {
+                                return;
+                            }
+
+                            futures::future::join_all(tasks.into_iter().map(|(task_res, ack_tx)| async move {
+                                match task_res {
+                                    Ok(Some(fut)) => match fut.await {
+                                        Ok(_) => {
+                                            let _ = ack_tx.send(Ok(()));
+                                        }
+                                        Err(e) => {
+                                            let _ = ack_tx.send(Err(Box::new(std::io::Error::other(e.to_string()))));
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        let _ = ack_tx.send(Ok(()));
+                                    }
+                                    Err(err_msg) => {
+                                        let _ = ack_tx.send(Err(Box::new(std::io::Error::other(err_msg))));
+                                    }
+                                }
+                            })).await;
+                        }));
                     }
                 });
 
