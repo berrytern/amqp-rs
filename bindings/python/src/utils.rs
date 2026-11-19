@@ -99,18 +99,29 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
 }
 
 #[pyclass(from_py_object)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Message {
     body: Arc<[u8]>,
     content_type: Option<String>,
-    cached_body: Arc<std::sync::OnceLock<Py<PyBytes>>>,
+    cached_body: std::sync::OnceLock<Py<PyBytes>>,
 }
+
+impl Clone for Message {
+    fn clone(&self) -> Self {
+        Self {
+            body: self.body.clone(),
+            content_type: self.content_type.clone(),
+            cached_body: std::sync::OnceLock::new(),
+        }
+    }
+}
+
 impl From<RuMessage> for Message {
     fn from(msg: RuMessage) -> Self {
         Self {
             body: msg.body,
             content_type: msg.content_type,
-            cached_body: Arc::new(std::sync::OnceLock::new()),
+            cached_body: std::sync::OnceLock::new(),
         }
     }
 }
@@ -134,7 +145,7 @@ impl Message {
         Ok(Self {
             body,
             content_type,
-            cached_body: Arc::new(std::sync::OnceLock::new()),
+            cached_body: std::sync::OnceLock::new(),
         })
     }
 

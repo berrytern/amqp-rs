@@ -21,6 +21,10 @@ use crate::{
     },
 };
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 struct BatchItem {
     exchange: Arc<str>,
     routing_key: Arc<str>,
@@ -60,6 +64,7 @@ pub fn init_tokio(worker_threads: Option<usize>) -> PyResult<()> {
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder.enable_all();
+    builder.thread_stack_size(1024 * 1024);
     if let Some(threads) = worker_threads {
         if threads == 0 {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -567,35 +572,21 @@ impl AsyncEventbus {
                             let handler_clone = handler.clone();
                             let locals_clone = locals.clone();
                             async move {
-                                pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                    let future_result = match Python::try_attach(|py| -> PyResult<_> {
-                                        let bound_handler = handler_clone.bind(py);
-                                        let coro = bound_handler.call1((Message::from(body),))?;
-
-                                        match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
-                                            Ok(fut) => Ok(fut),
-                                            Err(e) => {
-                                                if let Ok(close_fn) =
-                                                    coro.getattr(pyo3::intern!(py, "close"))
-                                                {
-                                                    let _ = close_fn.call0();
-                                                }
-                                                Err(e)
-                                            }
-                                        }
-                                    }) {
-                                        Some(res) => res,
-                                        None => return Ok(()),
-                                    };
-                                    match future_result {
-                                        Ok(py_future) => match py_future.await {
-                                            Ok(_) => Ok(()),
-                                            Err(e) => Err(Box::new(std::io::Error::other(e.to_string())) as _),
-                                        },
-                                        Err(e) => Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e))) as _),
-                                    }
-                                })
-                                .await
+                                let future_result = match Python::try_attach(|py| -> PyResult<_> {
+                                    let bound_handler = handler_clone.bind(py);
+                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                    pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
+                                }) {
+                                    Some(res) => res,
+                                    None => return Ok(()),
+                                };
+                                match future_result {
+                                    Ok(py_future) => match py_future.await {
+                                        Ok(_) => Ok(()),
+                                        Err(e) => Err(Box::new(std::io::Error::other(e.to_string())) as _),
+                                    },
+                                    Err(e) => Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e))) as _),
+                                }
                             }
                         },
                         process_timeout,
@@ -782,74 +773,58 @@ impl AsyncEventbus {
                         let handler_clone = handler.clone();
                         let locals_clone = locals.clone();
                         async move {
-                            pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                let py_future_result =
-                                    match Python::try_attach(|py| -> PyResult<_> {
-                                        let bound_handler = handler_clone.bind(py);
-                                        let coro = bound_handler.call1((Message::from(body),))?;
-
-                                        // Now into_future will successfully find the asyncio loop!
-                                        match pyo3_async_runtimes::tokio::into_future(coro.clone())
-                                        {
-                                            Ok(fut) => Ok(fut),
-                                            Err(e) => {
-                                                if let Ok(close_fn) =
-                                                    coro.getattr(pyo3::intern!(py, "close"))
-                                                {
-                                                    let _ = close_fn.call0();
-                                                }
-                                                Err(e)
+                            let py_future_result =
+                                match Python::try_attach(|py| -> PyResult<_> {
+                                    let bound_handler = handler_clone.bind(py);
+                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                    pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
+                                }) {
+                                    Some(res) => res,
+                                    None => {
+                                        return Err(Box::new(std::io::Error::other(
+                                            "Python runtime is finalizing or unavailable",
+                                        ))
+                                            as Box<dyn std::error::Error + Send + Sync>);
+                                    }
+                                };
+                            match py_future_result {
+                                Ok(py_future) => match py_future.await {
+                                    Ok(result) => {
+                                        match Python::try_attach(|py| {
+                                            if let Ok(message) = result.extract::<Message>(py) {
+                                                return Ok(RuMessage::from(message));
                                             }
-                                        }
-                                    }) {
-                                        Some(res) => res,
-                                        None => {
-                                            return Err(Box::new(std::io::Error::other(
+                                            match result.cast_bound::<PyBytes>(py) {
+                                                Ok(bytes) => Ok(RuMessage {
+                                                    body: bytes.as_bytes().into(),
+                                                    content_type: None,
+                                                }),
+                                                Err(_) => Err(Box::new(std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "RPC handler must return bytes",
+                                                ))
+                                                    as Box<
+                                                        dyn std::error::Error + Send + Sync,
+                                                    >),
+                                            }
+                                        }) {
+                                            Some(res) => res,
+                                            None => Err(Box::new(std::io::Error::other(
                                                 "Python runtime is finalizing or unavailable",
                                             ))
-                                                as Box<dyn std::error::Error + Send + Sync>);
+                                                as Box<dyn std::error::Error + Send + Sync>),
                                         }
-                                    };
-                                match py_future_result {
-                                    Ok(py_future) => match py_future.await {
-                                        Ok(result) => {
-                                            match Python::try_attach(|py| {
-                                                if let Ok(message) = result.extract::<Message>(py) {
-                                                    return Ok(RuMessage::from(message));
-                                                }
-                                                match result.cast_bound::<PyBytes>(py) {
-                                                    Ok(bytes) => Ok(RuMessage {
-                                                        body: bytes.as_bytes().into(),
-                                                        content_type: None,
-                                                    }),
-                                                    Err(_) => Err(Box::new(std::io::Error::new(
-                                                        std::io::ErrorKind::InvalidData,
-                                                        "RPC handler must return bytes",
-                                                    ))
-                                                        as Box<
-                                                            dyn std::error::Error + Send + Sync,
-                                                        >),
-                                                }
-                                            }) {
-                                                Some(res) => res,
-                                                None => Err(Box::new(std::io::Error::other(
-                                                    "Python runtime is finalizing or unavailable",
-                                                ))
-                                                    as Box<dyn std::error::Error + Send + Sync>),
-                                            }
-                                        }
-                                        Err(e) => Err(Box::new(std::io::Error::other(
-                                            e.to_string(),
-                                        ))
-                                            as Box<dyn std::error::Error + Send + Sync>),
-                                    },
+                                    }
                                     Err(e) => Err(Box::new(std::io::Error::other(
-                                        format!("Failed to execute Python callback: {}", e),
+                                        e.to_string(),
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>),
-                                }
-                            })
-                            .await
+                                },
+                                Err(e) => Err(Box::new(std::io::Error::other(
+                                    format!("Failed to execute Python callback: {}", e),
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>),
+                            }
                         }
                     },
                     process_timeout,
