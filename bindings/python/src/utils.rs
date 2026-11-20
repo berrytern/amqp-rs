@@ -98,12 +98,12 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
     }
 }
 
-#[pyclass(from_py_object)]
+#[pyclass(frozen, from_py_object)]
 #[derive(Debug)]
 pub struct Message {
-    body: Arc<[u8]>,
-    content_type: Option<String>,
-    cached_body: std::sync::OnceLock<Py<PyBytes>>,
+    pub body: Arc<[u8]>,
+    pub content_type: Option<String>,
+    pub cached_body: std::sync::OnceLock<Py<PyBytes>>,
 }
 
 impl Clone for Message {
@@ -133,6 +133,14 @@ impl From<Message> for RuMessage {
         }
     }
 }
+impl From<&Message> for RuMessage {
+    fn from(msg: &Message) -> Self {
+        Self {
+            body: msg.body.clone(),
+            content_type: msg.content_type.clone(),
+        }
+    }
+}
 
 #[pymethods]
 impl Message {
@@ -145,10 +153,11 @@ impl Message {
     #[staticmethod]
     #[pyo3(signature = (body, content_type=None))]
     fn new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
-        let body: Arc<[u8]> = body.as_bytes()?.into();
+        let detected_ct = body.content_type();
+        let body_bytes = body.to_arc_bytes();
         Ok(Self {
-            body,
-            content_type,
+            body: body_bytes,
+            content_type: content_type.or(detected_ct),
             cached_body: std::sync::OnceLock::new(),
         })
     }
@@ -537,6 +546,7 @@ pub enum Payload<'py> {
     Bytes(Bound<'py, PyBytes>),
     Str(Bound<'py, PyString>),
     ByteArray(Bound<'py, pyo3::types::PyByteArray>),
+    Message(Bound<'py, Message>),
 }
 
 impl<'py> Payload<'py> {
@@ -546,6 +556,7 @@ impl<'py> Payload<'py> {
             Payload::Bytes(b) => Ok(b.as_bytes()),
             Payload::Str(s) => Ok(s.to_str()?.as_bytes()),
             Payload::ByteArray(ba) => Ok(unsafe { ba.as_bytes() }),
+            Payload::Message(m) => Ok(&m.get().body),
         }
     }
 
@@ -555,6 +566,25 @@ impl<'py> Payload<'py> {
             Payload::Bytes(b) => Ok(b.as_bytes().to_vec()),
             Payload::Str(s) => Ok(s.to_str()?.as_bytes().to_vec()),
             Payload::ByteArray(ba) => Ok(unsafe { ba.as_bytes().to_vec() }),
+            Payload::Message(m) => Ok(m.get().body.to_vec()),
+        }
+    }
+
+    #[inline]
+    pub fn to_arc_bytes(&self) -> Arc<[u8]> {
+        match self {
+            Payload::Bytes(b) => b.as_bytes().into(),
+            Payload::Str(s) => s.to_str().map(|s| s.as_bytes().into()).unwrap_or_else(|_| Arc::from([])),
+            Payload::ByteArray(ba) => (unsafe { ba.as_bytes() }).into(),
+            Payload::Message(m) => m.get().body.clone(),
+        }
+    }
+
+    #[inline]
+    pub fn content_type(&self) -> Option<String> {
+        match self {
+            Payload::Message(m) => m.get().content_type.clone(),
+            _ => None,
         }
     }
 }

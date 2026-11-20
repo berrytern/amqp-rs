@@ -235,8 +235,8 @@ impl AsyncConnection {
                                             body,
                                             content_type: None,
                                         })
-                                    } else if let Ok(message) = bound.extract::<Message>() {
-                                        Ok(RuMessage::from(message))
+                                    } else if let Ok(msg_ref) = bound.cast::<Message>() {
+                                        Ok(RuMessage::from(msg_ref.get()))
                                     } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
                                         let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
                                         Ok(RuMessage {

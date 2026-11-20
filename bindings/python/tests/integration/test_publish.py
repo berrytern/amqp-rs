@@ -84,3 +84,36 @@ async def test_publish_bytearray():
     assert response.body == bytes(message)
     await eventbus.dispose()
 
+@pytest.mark.asyncio
+async def test_publish_and_rpc_with_message_object():
+    future = Future(loop=get_running_loop())
+    options = ConfigOptions(queue_name='test_msg_obj_q', rpc_exchange_name='test_msg_obj_ex', rpc_queue_name='test_msg_obj_rq')
+    eventbus = AsyncEventbus(Config(host='localhost', port=5672, username='guest', password='guest', virtual_host='/', options=options, tls_adaptor=None), QoSConfig(pub_confirm=True, rpc_client_confirm=True, rpc_server_confirm=True, sub_auto_ack=True, rpc_server_auto_ack=True, rpc_client_auto_ack=True))
+
+    async def handle_rpc(msg: Message):
+        mv = msg.memoryview()
+        assert len(mv) > 0
+        return Message(b"rpc-msg-response", "application/json")
+
+    await eventbus.provide_resource("rpc.msg.test", handle_rpc)
+
+    # 1. Test passing Message to rpc_client
+    req_msg = Message(b"rpc-msg-request", "application/json")
+    rpc_res = await eventbus.rpc_client("test_msg_obj_ex", "rpc.msg.test", req_msg)
+    assert rpc_res == b"rpc-msg-response"
+
+    # 2. Test passing Message to publish
+    async def handle_sub(msg: Message):
+        if not future.done():
+            future.set_result(msg)
+
+    await eventbus.subscribe("test_msg_pub", "test.msg.key", handle_sub)
+    pub_msg = Message(b"pub-msg-content", "text/plain")
+    await eventbus.publish("test_msg_pub", "test.msg.key", pub_msg)
+    await future
+    assert future.done()
+    rec_msg: Message = future.result()
+    assert rec_msg.body == b"pub-msg-content"
+    await eventbus.dispose()
+
+

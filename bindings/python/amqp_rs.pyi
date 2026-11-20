@@ -1,6 +1,8 @@
-from typing import Callable, Optional, Awaitable, Union
+from typing import Callable, Optional, Awaitable, Union, Sequence
 from concurrent.futures import Future
 from enum import Enum
+
+PayloadType = Union[bytes, str, bytearray, "Message"]
 
 
 def init_tokio(worker_threads: Optional[int] = None) -> None: ...
@@ -10,10 +12,10 @@ class Message:
     body: bytes
     content_type: Optional[str]
 
-    def __init__(self, body: Union[bytes, bytearray, str], content_type: Optional[str] = None) -> None: ...
+    def __init__(self, body: PayloadType, content_type: Optional[str] = None) -> None: ...
 
     @staticmethod
-    def new(body: Union[bytes, bytearray, str], content_type: Optional[str] = None) -> "Message": ...
+    def new(body: PayloadType, content_type: Optional[str] = None) -> "Message": ...
 
     def memoryview(self) -> memoryview: ...
 
@@ -168,7 +170,7 @@ class AsyncEventbus:
         self, 
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: Optional[str] = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         publish_timeout: int = 16,
@@ -212,7 +214,7 @@ class AsyncEventbus:
         self,
         exchange_name: str,
         routing_key: str,
-        messages: list[Union[bytes, str]],
+        messages: Sequence[PayloadType],
         content_type: Optional[str] = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         publish_timeout: int = 16,
@@ -227,7 +229,7 @@ class AsyncEventbus:
         self, 
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: str = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         response_timeout: int = 20_000,
@@ -387,7 +389,7 @@ class AsyncConnection:
         self,
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: str,
         content_encoding: ContentEncoding,
         command_timeout: Optional[int] = None,
@@ -409,7 +411,7 @@ class AsyncConnection:
 
     def rpc_server(
         self,
-        handler: Callable[[Message], Awaitable[Union[Message, bytes]]],
+        handler: Callable[[Message], Awaitable[Union[Message, bytes, bytearray, str]]],
         routing_key: str,
         exchange_name: str,
         exchange_type: str,
@@ -423,7 +425,7 @@ class AsyncConnection:
         self,
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: str,
         content_encoding: ContentEncoding,
         response_timeout_millis: int,

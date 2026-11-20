@@ -242,9 +242,10 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
+        let detected_ct = body.content_type();
         let exchange_name: Arc<str> = Arc::from(exchange_name);
         let routing_key: Arc<str> = Arc::from(routing_key);
-        let content_type: Arc<str> = Arc::from(content_type.unwrap_or("application/json"));
+        let content_type: Arc<str> = Arc::from(content_type.or(detected_ct.as_deref()).unwrap_or("application/json"));
         let payload_bytes = body.into_vec()?;
         let cmd_timeout = command_timeout.map(std::time::Duration::from_secs);
 
@@ -384,9 +385,15 @@ impl AsyncEventbus {
     ) -> PyResult<Bound<'py, PyAny>> {
         let eventbus = Arc::clone(&slf.eventbus);
 
+        let detected_ct = body.content_type();
         let exchange_name: Arc<str> = Arc::from(exchange_name);
         let routing_key: Arc<str> = Arc::from(routing_key);
-        let content_type: Arc<str> = Arc::from(content_type);
+        let ct = if content_type == "application/json" {
+            detected_ct.unwrap_or_else(|| content_type.to_string())
+        } else {
+            content_type.to_string()
+        };
+        let content_type: Arc<str> = Arc::from(ct.as_str());
         let payload_bytes = body.into_vec()?;
         let content_encoding = content_encoding.clone();
 
@@ -788,8 +795,8 @@ impl AsyncEventbus {
                                                     body,
                                                     content_type: None,
                                                 })
-                                            } else if let Ok(message) = bound.extract::<Message>() {
-                                                Ok(RuMessage::from(message))
+                                            } else if let Ok(msg_ref) = bound.cast::<Message>() {
+                                                Ok(RuMessage::from(msg_ref.get()))
                                             } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
                                                 let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
                                                 Ok(RuMessage {
