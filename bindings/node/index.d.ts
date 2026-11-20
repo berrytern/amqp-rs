@@ -22,6 +22,11 @@ export interface ConfigOptions {
   queueName: string
   rpcExchangeName: string
   rpcQueueName: string
+  deadLetterExchange?: string
+  deadLetterRoutingKey?: string
+  maxPendingCommands?: number
+  maxPendingBytes?: number
+  failFastOnDisconnect?: boolean
 }
 
 export declare const enum ContentEncoding {

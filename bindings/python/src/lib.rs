@@ -1,320 +1,232 @@
-use std::{sync::Arc};
-use amqp_client_rust::{
-    amqprs::tls::{TlsAdaptor as RuTlsAdaptor}, api::{
-        eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
-        utils::{ContentEncoding as RuContentEncoding, DeliveryMode as RuDeliveryMode, Message as RuMessage},
-    }, domain::config::{
-        Config as RuConfig, ConfigOptions as RuConfigOptions, QoSConfig as RuQoSConfig,
-    }
+use amqp_client_rust::api::{
+    eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
+    utils::{
+        Message as RuMessage, PublishOptions as RuPublishOptions,
+        RpcClientOptions as RuRpcClientOptions,
+    },
 };
-use pyo3::{
-    exceptions::PyValueError, prelude::*, types::{PyBytes, PyString}
-};
+use pyo3::{prelude::*, types::PyBytes};
+use std::sync::Arc;
+pub use amqp_client_rust;
+pub mod api;
 pub mod exceptions;
+pub mod utils;
 use exceptions::AppError;
-use std::path::PathBuf;
 
-/*static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create Tokio runtime")
-});*/
-#[pyclass(skip_from_py_object)]
-#[derive(Clone)]
-struct AsyncEventbus {
-    eventbus: Arc<RuAsyncEventbusRabbitMQ>,
+use crate::{
+    api::connection::AsyncConnection,
+    utils::{
+        BatchConfig, Config, ConfigOptions, ContentEncoding, DeliveryAck, DeliveryMode, Message,
+        Payload, PublishConfirmations, QoSConfig, QueueOptions, TlsAdaptor,
+    },
+};
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+struct BatchItem {
+    exchange: Arc<str>,
+    routing_key: Arc<str>,
+    payload: Vec<u8>,
+    content_type: Arc<str>,
+    content_encoding: ContentEncoding,
+    command_timeout: Option<std::time::Duration>,
+    delivery_mode: DeliveryMode,
+    expiration: Option<u32>,
+    ack_sender: tokio::sync::oneshot::Sender<Result<(), AppError>>,
 }
 
-#[pyclass(from_py_object, get_all, set_all)]
-#[derive(Debug, Clone)]
-pub enum DeliveryMode {
-    Transient = 1,
-    Persistent = 2,
+struct SubItem {
+    message: RuMessage,
+    ack_tx: tokio::sync::oneshot::Sender<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
-impl From<DeliveryMode> for RuDeliveryMode {
-    fn from(mode: DeliveryMode) -> Self {
-        match mode {
-            DeliveryMode::Transient => RuDeliveryMode::Transient,
-            DeliveryMode::Persistent => RuDeliveryMode::Persistent,
-        }
+
+static TOKIO_INITIALIZED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn enter_active_runtime() -> Option<tokio::runtime::EnterGuard<'static>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        None
+    } else {
+        TOKIO_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+        Some(pyo3_async_runtimes::tokio::get_runtime().enter())
     }
+}
+
+#[pyfunction]
+#[pyo3(signature = (worker_threads=None))]
+pub fn init_tokio(worker_threads: Option<usize>) -> PyResult<()> {
+    if TOKIO_INITIALIZED.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            "Tokio runtime has already been initialized",
+        ));
+    }
+
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+    builder.thread_stack_size(1024 * 1024);
+    if let Some(threads) = worker_threads {
+        if threads == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker_threads must be greater than 0",
+            ));
+        }
+        builder.worker_threads(threads);
+    }
+    pyo3_async_runtimes::tokio::init(builder);
+    let _ = pyo3_async_runtimes::tokio::get_runtime();
+    TOKIO_INITIALIZED.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 #[pyclass(from_py_object)]
-#[derive(Debug, Clone)]
-pub struct Message {
-    body: Arc<[u8]>,
-    content_type: Option<String>,
-}
-impl From<RuMessage> for Message {
-    fn from(msg: RuMessage) -> Self {
-        Self {
-            body: msg.body,
-            content_type: msg.content_type,
-        }
-    }
-}
-impl From<Message> for RuMessage {
-    fn from(msg: Message) -> Self {
-        Self {
-            body: msg.body,
-            content_type: msg.content_type,
-        }
-    }
+#[derive(Clone)]
+pub struct AsyncEventbus {
+    pub eventbus: Arc<RuAsyncEventbusRabbitMQ>,
+    batch_sender: Option<tokio::sync::mpsc::UnboundedSender<BatchItem>>,
+    batch_config: BatchConfig,
 }
 
-#[pymethods]
-impl Message {
-    #[staticmethod]
-    fn new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
-        let body: Arc<[u8]> = match body {
-            Payload::Bytes(b) => b.as_bytes().into(),
-            Payload::Str(s) => s.to_str()?.as_bytes().into(),
+impl AsyncEventbus {
+    /// Creates an `AsyncEventbus` from an existing native Rust `RuAsyncEventbusRabbitMQ`.
+    pub fn from_inner(eventbus: Arc<RuAsyncEventbusRabbitMQ>, batch_config: Option<BatchConfig>) -> Self {
+        let resolved_batch_config = batch_config.unwrap_or(BatchConfig {
+            enabled: false,
+            max_batch_size: 100,
+            max_delay_ms: 0,
+            max_payload_bytes: 1024,
+        });
+
+        let batch_sender = if resolved_batch_config.enabled {
+            let _guard = enter_active_runtime();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BatchItem>();
+            let bus = Arc::clone(&eventbus);
+            let max_batch_size = resolved_batch_config.max_batch_size;
+            let max_delay = std::time::Duration::from_millis(resolved_batch_config.max_delay_ms);
+
+            tokio::spawn(async move {
+                let mut batch = Vec::with_capacity(max_batch_size);
+                while let Some(first) = rx.recv().await {
+                    batch.push(first);
+
+                    if max_delay.as_nanos() > 0 {
+                        let deadline = tokio::time::Instant::now() + max_delay;
+                        while batch.len() < max_batch_size {
+                            tokio::select! {
+                                biased;
+                                item = rx.recv() => {
+                                    match item {
+                                        Some(item) => batch.push(item),
+                                        None => break,
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        while batch.len() < max_batch_size {
+                            match rx.try_recv() {
+                                Ok(item) => batch.push(item),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    for item in batch.drain(..) {
+                        let b = Arc::clone(&bus);
+                        tokio::spawn(async move {
+                            let pub_opts = RuPublishOptions {
+                                content_type: &item.content_type,
+                                content_encoding: item.content_encoding.into(),
+                                command_timeout: item.command_timeout,
+                                delivery_mode: item.delivery_mode.into(),
+                                expiration: item.expiration,
+                            };
+                            let res = b.publish(
+                                &item.exchange,
+                                &item.routing_key,
+                                item.payload,
+                                &pub_opts,
+                            ).await;
+                            let _ = item.ack_sender.send(res.map_err(AppError::from));
+                        });
+                    }
+                }
+            });
+            Some(tx)
+        } else {
+            None
         };
-        Ok(Self {
-            body,
-            content_type,
-        })
-    }
 
-    #[getter]
-    fn body<'py>(slf: PyRef<'py, Self>) -> Bound<'py, PyBytes> {
-        PyBytes::new(slf.py(), &slf.body)
-    }
-    #[getter]
-    fn content_type(&self) -> Option<&str> {
-        self.content_type.as_deref()
-    }
-}
-
-#[pyclass(from_py_object, get_all, set_all)]
-#[derive(Debug, Clone)]
-pub enum ContentEncoding {
-    Zstd,
-    Lz4,
-    Zlib,
-    Null,
-}
-impl Into<RuContentEncoding> for ContentEncoding {
-    fn into(self) -> RuContentEncoding {
-        match self {
-            ContentEncoding::Zstd => RuContentEncoding::Zstd,
-            ContentEncoding::Lz4 => RuContentEncoding::Lz4,
-            ContentEncoding::Zlib => RuContentEncoding::Zlib,
-            ContentEncoding::Null => RuContentEncoding::None,
-        }
-    }
-}
-
-#[pyclass(from_py_object, get_all, set_all)]
-#[derive(Debug, Clone)]
-pub struct ConfigOptions {
-    queue_name: String,
-    rpc_exchange_name: String,
-    rpc_queue_name: String,
-}
-#[pymethods]
-impl ConfigOptions {
-    #[new]
-    fn new(queue_name: String, rpc_exchange_name: String, rpc_queue_name: String) -> Self {
         Self {
-            queue_name,
-            rpc_exchange_name,
-            rpc_queue_name,
-        }
-    }
-}
-impl From<ConfigOptions> for RuConfigOptions {
-    fn from(options: ConfigOptions) -> Self {
-        Self {
-            queue_name: options.queue_name,
-            rpc_exchange_name: options.rpc_exchange_name,
-            rpc_queue_name: options.rpc_queue_name,
-        }
-    }
-}
-
-#[pyclass(from_py_object, get_all, set_all)]
-#[derive(Clone)]
-pub struct Config {
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    pub password: String,
-    pub virtual_host: String,
-    pub options: ConfigOptions,
-    pub tls_adaptor: Option<TlsAdaptor>, // Placeholder for TLS adaptor
-}
-#[pymethods]
-impl Config {
-    #[new]
-    #[pyo3(signature = (host, port, username, password, virtual_host, options, tls_adaptor=None))]
-    fn new(
-        host: String,
-        port: u16,
-        username: String,
-        password: String,
-        virtual_host: String,
-        options: ConfigOptions,
-        tls_adaptor: Option<TlsAdaptor>,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            username,
-            password,
-            virtual_host,
-            options,
-            tls_adaptor,
-        }
-    }
-}
-
-impl From<Config> for RuConfig {
-    fn from(config: Config) -> Self {
-        Self {
-            host: config.host,
-            port: config.port,
-            username: config.username,
-            password: config.password,
-            virtual_host: config.virtual_host,
-            options: config.options.into(),
-            tls_adaptor: config.tls_adaptor.map(|t| t.into()),
-        }
-    }
-}
-#[pyclass(from_py_object)]
-#[derive(Clone)]
-pub struct TlsAdaptor {
-    pub(crate) inner: Arc<RuTlsAdaptor>,
-}
-
-#[pymethods]
-impl TlsAdaptor {
-    #[staticmethod]
-    pub fn with_client_auth(
-        ca_path: Option<PathBuf>,
-        cert_path: PathBuf,
-        key_path: PathBuf,
-        domain: String,
-    ) -> PyResult<Self> {
-        amqp_rs_core::install_crypto_provider()?;
-        let (connection, domain) = amqp_rs_core::with_client_auth(ca_path.as_deref(), cert_path.as_path(), key_path.as_path(), domain)?;
-        let tls_adaptor = RuTlsAdaptor::new(connection, domain);
-        let inner = Arc::new(
-            tls_adaptor
-        );
-        Ok(Self { inner })
-    }
-    #[staticmethod]
-    pub fn without_client_auth(root_ca_cert: Option<PathBuf>, domain: String) -> PyResult<Self> {
-        amqp_rs_core::install_crypto_provider()?;
-        let inner = Arc::new(
-            RuTlsAdaptor::without_client_auth(root_ca_cert.as_deref(), domain)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        );
-        Ok(Self { inner })
-    }
-}
-impl From<TlsAdaptor> for RuTlsAdaptor {
-    fn from(adaptor: TlsAdaptor) -> Self {
-        Arc::unwrap_or_clone(adaptor.inner)
-    }
-}
-
-#[pyclass(from_py_object, get_all, set_all)]
-#[derive(Debug, Clone)]
-pub struct QoSConfig {
-    pub pub_confirm: bool,
-    pub rpc_client_confirm: bool,
-    pub rpc_server_confirm: bool,
-    pub sub_auto_ack: bool,
-    pub rpc_server_auto_ack: bool,
-    pub rpc_client_auto_ack: bool,
-    pub sub_prefetch: Option<u16>,
-    pub rpc_server_prefetch: Option<u16>,
-    pub rpc_client_prefetch: Option<u16>,
-}
-#[pymethods]
-impl QoSConfig {
-    #[new]
-    #[pyo3(signature = (pub_confirm=true, rpc_client_confirm=true, rpc_server_confirm=false, sub_auto_ack=false, rpc_server_auto_ack=false, rpc_client_auto_ack=false, sub_prefetch=None, rpc_server_prefetch=None, rpc_client_prefetch=None))]
-    fn new(
-        pub_confirm: bool,
-        rpc_client_confirm: bool,
-        rpc_server_confirm: bool,
-        sub_auto_ack: bool,
-        rpc_server_auto_ack: bool,
-        rpc_client_auto_ack: bool,
-        sub_prefetch: Option<u16>,
-        rpc_server_prefetch: Option<u16>,
-        rpc_client_prefetch: Option<u16>,
-    ) -> Self {
-        Self {
-            pub_confirm,
-            rpc_client_confirm,
-            rpc_server_confirm,
-            sub_auto_ack,
-            rpc_server_auto_ack,
-            rpc_client_auto_ack,
-            sub_prefetch,
-            rpc_server_prefetch,
-            rpc_client_prefetch,
+            eventbus,
+            batch_sender,
+            batch_config: resolved_batch_config,
         }
     }
 
-    #[staticmethod]
-    pub fn default() -> Self {
-        Self {
-            pub_confirm: true,
-            rpc_client_confirm: true,
-            rpc_server_confirm: false,
-            sub_auto_ack: false,
-            rpc_server_auto_ack: false,
-            rpc_client_auto_ack: false,
-            sub_prefetch: None,
-            rpc_server_prefetch: None,
-            rpc_client_prefetch: None,
-        }
-    }
-}
-impl From<QoSConfig> for RuQoSConfig {
-    fn from(config: QoSConfig) -> Self {
-        Self {
-            pub_confirm: config.pub_confirm,
-            rpc_client_confirm: config.rpc_client_confirm,
-            rpc_server_confirm: config.rpc_server_confirm,
-            sub_auto_ack: config.sub_auto_ack,
-            rpc_server_auto_ack: config.rpc_server_auto_ack,
-            rpc_client_auto_ack: config.rpc_client_auto_ack,
-            sub_prefetch: config.sub_prefetch,
-            rpc_server_prefetch: config.rpc_server_prefetch,
-            rpc_client_prefetch: config.rpc_client_prefetch,
-        }
+    /// Returns a cloned `Arc` to the underlying native Rust `RuAsyncEventbusRabbitMQ`.
+    ///
+    /// This allows Rust code to call AMQP publish/subscribe directly with zero FFI overhead.
+    #[inline]
+    pub fn inner(&self) -> Arc<RuAsyncEventbusRabbitMQ> {
+        Arc::clone(&self.eventbus)
     }
 }
 
-#[derive(FromPyObject)]
-pub enum Payload<'py> {
-    Bytes(Bound<'py, PyBytes>),
-    Str(Bound<'py, PyString>),
-}
 #[pymethods]
 impl AsyncEventbus {
     #[new]
-    fn new(config: Config, qos_config: QoSConfig) -> Self {
-        let rt = pyo3_async_runtimes::tokio::get_runtime();
+    #[pyo3(signature = (config, qos_config, batch_config=None))]
+    fn new(
+        config: Config,
+        qos_config: QoSConfig,
+        batch_config: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let resolved_batch_config = if let Some(bc) = batch_config {
+            if let Ok(b) = bc.extract::<bool>() {
+                BatchConfig {
+                    enabled: b,
+                    max_batch_size: 100,
+                    max_delay_ms: 0,
+                    max_payload_bytes: 1024,
+                }
+            } else if let Ok(cfg) = bc.extract::<BatchConfig>() {
+                cfg
+            } else {
+                return Err(pyo3::exceptions::PyTypeError::new_err(
+                    "batch_config must be a bool or an instance of BatchConfig",
+                ));
+            }
+        } else if let Some(cfg) = &config.options.batch_config {
+            cfg.clone()
+        } else {
+            BatchConfig {
+                enabled: false,
+                max_batch_size: 100,
+                max_delay_ms: 0,
+                max_payload_bytes: 1024,
+            }
+        };
 
-        let _guard = rt.enter();
-        Self {
-            eventbus: Arc::new(RuAsyncEventbusRabbitMQ::new(
-                config.into(),
-                qos_config.into(),
-            )),
-        }
+        let _guard = enter_active_runtime();
+
+        let eventbus = Arc::new(RuAsyncEventbusRabbitMQ::new(
+            config.into(),
+            qos_config.into(),
+        ));
+
+        Ok(Self::from_inner(eventbus, Some(resolved_batch_config)))
     }
 
+    #[getter]
+    fn batch_config(&self) -> BatchConfig {
+        self.batch_config.clone()
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
     #[pyo3(signature = (exchange_name, routing_key, body, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient, expiration=None))]
     fn publish<'py>(
         slf: PyRef<'py, Self>,
@@ -330,36 +242,134 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
-        let exchange_name = exchange_name.to_owned();
-        let routing_key = routing_key.to_owned();
-        let payload_bytes = match body {
-            Payload::Bytes(b) => b.as_bytes().to_vec(),
-            Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
-        };
+        let detected_ct = body.content_type();
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let content_type: Arc<str> = Arc::from(content_type.or(detected_ct.as_deref()).unwrap_or("application/json"));
+        let payload_bytes = body.into_vec()?;
+        let cmd_timeout = command_timeout.map(std::time::Duration::from_secs);
 
-        let content_type = content_type.map(|s| s.to_owned());
+        if let Some(sender) = &slf.batch_sender {
+            if payload_bytes.len() <= slf.batch_config.max_payload_bytes {
+                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                let item = BatchItem {
+                    exchange: exchange_name,
+                    routing_key,
+                    payload: payload_bytes,
+                    content_type,
+                    content_encoding,
+                    command_timeout: cmd_timeout,
+                    delivery_mode,
+                    expiration,
+                    ack_sender: ack_tx,
+                };
+
+                if let Err(e) = sender.send(item) {
+                    return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Batch sender channel closed: {}", e
+                    )));
+                }
+
+                return pyo3_async_runtimes::tokio::future_into_py(py, async move {
+                    match ack_rx.await {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(e)) => Err(e.into()),
+                        Err(_) => Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "Batch acknowledgment channel closed",
+                        )),
+                    }
+                });
+            }
+        }
+
         let content_encoding = content_encoding.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+            let pub_opts = RuPublishOptions {
+                content_type: &content_type,
+                content_encoding: content_encoding.into(),
+                command_timeout: cmd_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
             match eventbus
                 .publish(
                     &exchange_name,
                     &routing_key,
                     payload_bytes,
-                    content_type.as_deref(),
-                    content_encoding.into(),
-                    command_timeout,
-                    Some(delivery_mode.into()),
-                    expiration,
+                    &pub_opts,
                 )
                 .await
             {
                 Ok(res) => Ok(res),
-                Err(e) => return Err(AppError::from(e).into()),
+                Err(e) => Err(AppError::from(e).into()),
             }
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (exchange_name, routing_key, messages, content_type=Some("application/json"), content_encoding=ContentEncoding::Null, command_timeout=16, delivery_mode=DeliveryMode::Transient))]
+    fn publish_batch<'py>(
+        slf: PyRef<'py, Self>,
+        exchange_name: &'py str,
+        routing_key: &'py str,
+        messages: Vec<Payload<'py>>,
+        content_type: Option<&'py str>,
+        content_encoding: ContentEncoding,
+        command_timeout: Option<u64>,
+        delivery_mode: DeliveryMode,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let eventbus = Arc::clone(&slf.eventbus);
+        let py = slf.py();
+
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let content_type: Arc<str> = Arc::from(content_type.unwrap_or("application/json"));
+        let content_encoding = content_encoding.clone();
+
+        let mut payloads = Vec::with_capacity(messages.len());
+        for body in messages {
+            payloads.push(body.into_vec()?);
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+            let mut tasks = Vec::with_capacity(payloads.len());
+            for payload in payloads {
+                let bus = Arc::clone(&eventbus);
+                let ex = Arc::clone(&exchange_name);
+                let rk = Arc::clone(&routing_key);
+                let ct = Arc::clone(&content_type);
+                let ce = content_encoding.clone();
+                let dm = delivery_mode.clone();
+                tasks.push(tokio::spawn(async move {
+                    let pub_opts = RuPublishOptions {
+                        content_type: &ct,
+                        content_encoding: ce.into(),
+                        command_timeout,
+                        delivery_mode: dm.into(),
+                        expiration: None,
+                    };
+                    bus.publish(
+                        &ex,
+                        &rk,
+                        payload,
+                        &pub_opts,
+                    )
+                    .await
+                }));
+            }
+            for task in tasks {
+                match task.await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => return Err(AppError::from(e).into()),
+                    Err(e) => return Err(pyo3::exceptions::PyRuntimeError::new_err(e.to_string())),
+                }
+            }
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (exchange_name, routing_key, body, content_type="application/json", content_encoding=ContentEncoding::Null, response_timeout=20_000, connection_timeout=Some(32), delivery_mode=DeliveryMode::Transient, expiration=None))]
     fn rpc_client<'py>(
         slf: PyRef<'py, Self>,
@@ -375,44 +385,228 @@ impl AsyncEventbus {
     ) -> PyResult<Bound<'py, PyAny>> {
         let eventbus = Arc::clone(&slf.eventbus);
 
-        let exchange_name = exchange_name.to_owned();
-        let routing_key = routing_key.to_owned();
-        let payload_bytes = match body {
-            Payload::Bytes(b) => b.as_bytes().to_vec(),
-            Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
+        let detected_ct = body.content_type();
+        let exchange_name: Arc<str> = Arc::from(exchange_name);
+        let routing_key: Arc<str> = Arc::from(routing_key);
+        let ct = if content_type == "application/json" {
+            detected_ct.unwrap_or_else(|| content_type.to_string())
+        } else {
+            content_type.to_string()
         };
-        let content_type = content_type.to_owned();
+        let content_type: Arc<str> = Arc::from(ct.as_str());
+        let payload_bytes = body.into_vec()?;
         let content_encoding = content_encoding.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
             let conn_timeout = connection_timeout.map(std::time::Duration::from_secs);
-            let response = match eventbus
+            let rpc_opts = RuRpcClientOptions {
+                content_type: &content_type,
+                content_encoding: content_encoding.into(),
+                response_timeout_millis: response_timeout,
+                command_timeout: conn_timeout,
+                delivery_mode: delivery_mode.into(),
+                expiration,
+            };
+            match eventbus
                 .rpc_client(
                     &exchange_name,
                     &routing_key,
                     payload_bytes,
-                    &content_type,
-                    content_encoding.into(),
-                    response_timeout,
-                    conn_timeout,
-                    Some(delivery_mode.into()),
-                    expiration,
+                    &rpc_opts,
                 )
                 .await
             {
                 Ok(res) => Ok(res),
                 Err(e) => Err(AppError::from(e).into()),
-            };
-            response
+            }
         })
     }
 
-    #[pyo3(signature = (exchange_name, routing_key, handler, process_timeout=None, command_timeout=Some(16)))]
+    #[pyo3(signature = (exchange_name, routing_key, handler, process_timeout=None, command_timeout=Some(16), batch_dispatch=None))]
     fn subscribe<'py>(
         slf: PyRef<'py, Self>,
         exchange_name: &str,
         routing_key: &str,
         handler: Py<PyAny>,
+        process_timeout: Option<u64>,
+        command_timeout: Option<u64>,
+        batch_dispatch: Option<bool>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let eventbus = Arc::clone(&slf.eventbus);
+        let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
+        let py = slf.py();
+        let handler = Arc::new(handler);
+        let exchange_name = exchange_name.to_owned();
+        let routing_key = routing_key.to_owned();
+        let use_batch = batch_dispatch.unwrap_or(slf.batch_config.enabled);
+        let max_batch_size = slf.batch_config.max_batch_size;
+        let max_delay_ms = slf.batch_config.max_delay_ms;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let process_timeout = process_timeout.map(std::time::Duration::from_secs);
+            let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+
+            if use_batch {
+                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<SubItem>(1024);
+                let max_delay = std::time::Duration::from_millis(max_delay_ms);
+                let locals_clone = locals.clone();
+                let handler_clone = handler.clone();
+
+                tokio::spawn(async move {
+                    let mut batch = Vec::with_capacity(max_batch_size);
+
+                    while let Some(first) = sub_rx.recv().await {
+                        batch.push(first);
+
+                        if max_delay.as_nanos() > 0 {
+                            let deadline = tokio::time::Instant::now() + max_delay;
+                            while batch.len() < max_batch_size {
+                                tokio::select! {
+                                    biased;
+                                    item = sub_rx.recv() => {
+                                        match item {
+                                            Some(item) => batch.push(item),
+                                            None => break,
+                                        }
+                                    }
+                                    _ = tokio::time::sleep_until(deadline) => break,
+                                }
+                            }
+                        } else {
+                            while batch.len() < max_batch_size {
+                                match sub_rx.try_recv() {
+                                    Ok(item) => batch.push(item),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+
+                        let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch_size));
+                        let item_handler = handler_clone.clone();
+                        let item_locals = locals_clone.clone();
+
+                        tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
+                            let mut tasks = Vec::with_capacity(current_batch.len());
+                            let attach_opt = Python::try_attach(|py| {
+                                let bound_handler = item_handler.bind(py);
+                                for item in current_batch {
+                                    let msg = Message::from(item.message);
+                                    match bound_handler.call1((msg,)) {
+                                        Ok(res) => match pyo3_async_runtimes::tokio::into_future(res.clone()) {
+                                            Ok(fut) => tasks.push((Ok(Some(fut)), item.ack_tx)),
+                                            Err(_) => {
+                                                if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
+                                                    let _ = close_fn.call0();
+                                                }
+                                                tasks.push((Ok(None), item.ack_tx));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            tasks.push((Err(e.to_string()), item.ack_tx));
+                                        }
+                                    }
+                                }
+                            });
+
+                            if attach_opt.is_none() {
+                                return;
+                            }
+
+                            futures::future::join_all(tasks.into_iter().map(|(task_res, ack_tx)| async move {
+                                match task_res {
+                                    Ok(Some(fut)) => match fut.await {
+                                        Ok(_) => {
+                                            let _ = ack_tx.send(Ok(()));
+                                        }
+                                        Err(e) => {
+                                            let _ = ack_tx.send(Err(Box::new(std::io::Error::other(e.to_string()))));
+                                        }
+                                    },
+                                    Ok(None) => {
+                                        let _ = ack_tx.send(Ok(()));
+                                    }
+                                    Err(err_msg) => {
+                                        let _ = ack_tx.send(Err(Box::new(std::io::Error::other(err_msg))));
+                                    }
+                                }
+                            })).await;
+                        }));
+                    }
+                });
+
+                let sub_tx = sub_tx.clone();
+                match eventbus
+                    .subscribe(
+                        &exchange_name,
+                        &routing_key,
+                        move |body| {
+                            let tx = sub_tx.clone();
+                            async move {
+                                let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                                if tx.send(SubItem { message: body, ack_tx }).await.is_err() {
+                                    return Err(Box::new(std::io::Error::other("Subscription channel closed")) as _);
+                                }
+                                match ack_rx.await {
+                                    Ok(res) => res,
+                                    Err(_) => Err(Box::new(std::io::Error::other("Ack channel dropped")) as _),
+                                }
+                            }
+                        },
+                        process_timeout,
+                        command_timeout,
+                    )
+                    .await
+                {
+                    Ok(res) => Ok(res),
+                    Err(e) => Err(AppError::from(e).into()),
+                }
+            } else {
+                match eventbus
+                    .subscribe(
+                        &exchange_name,
+                        &routing_key,
+                        move |body| {
+                            let handler_clone = handler.clone();
+                            let locals_clone = locals.clone();
+                            async move {
+                                let future_result = match Python::try_attach(|py| -> PyResult<_> {
+                                    let bound_handler = handler_clone.bind(py);
+                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                    pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
+                                }) {
+                                    Some(res) => res,
+                                    None => return Ok(()),
+                                };
+                                match future_result {
+                                    Ok(py_future) => match py_future.await {
+                                        Ok(_) => Ok(()),
+                                        Err(e) => Err(Box::new(std::io::Error::other(e.to_string())) as _),
+                                    },
+                                    Err(e) => Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e))) as _),
+                                }
+                            }
+                        },
+                        process_timeout,
+                        command_timeout,
+                    )
+                    .await
+                {
+                    Ok(res) => Ok(res),
+                    Err(e) => Err(AppError::from(e).into()),
+                }
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (exchange_name, routing_key, handler, batch_size=100, max_delay_ms=0, process_timeout=None, command_timeout=Some(16)))]
+    fn subscribe_batch<'py>(
+        slf: PyRef<'py, Self>,
+        exchange_name: &str,
+        routing_key: &str,
+        handler: Py<PyAny>,
+        batch_size: usize,
+        max_delay_ms: u64,
         process_timeout: Option<u64>,
         command_timeout: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
@@ -427,38 +621,117 @@ impl AsyncEventbus {
             let process_timeout = process_timeout.map(std::time::Duration::from_secs);
             let command_timeout = command_timeout.map(std::time::Duration::from_secs);
 
+            let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<SubItem>(1024);
+            let max_delay = std::time::Duration::from_millis(max_delay_ms);
+            let locals_clone = locals.clone();
+            let handler_clone = handler.clone();
+
+            tokio::spawn(async move {
+                let mut batch = Vec::with_capacity(batch_size);
+
+                while let Some(first) = sub_rx.recv().await {
+                    batch.push(first);
+
+                    if max_delay.as_nanos() > 0 {
+                        let deadline = tokio::time::Instant::now() + max_delay;
+                        while batch.len() < batch_size {
+                            tokio::select! {
+                                biased;
+                                item = sub_rx.recv() => {
+                                    match item {
+                                        Some(item) => batch.push(item),
+                                        None => break,
+                                    }
+                                }
+                                _ = tokio::time::sleep_until(deadline) => break,
+                            }
+                        }
+                    } else {
+                        while batch.len() < batch_size {
+                            match sub_rx.try_recv() {
+                                Ok(item) => batch.push(item),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+
+                    let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+                    let item_handler = handler_clone.clone();
+                    let item_locals = locals_clone.clone();
+                    let (messages, ack_txs): (Vec<Message>, Vec<_>) = current_batch
+                        .into_iter()
+                        .map(|item| (Message::from(item.message), item.ack_tx))
+                        .unzip();
+
+                    tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
+                        let py_future_res = Python::try_attach(|py| -> PyResult<_> {
+                            let py_messages = pyo3::types::PyList::new(py, messages)?;
+                            let bound_handler = item_handler.bind(py);
+                            let res = bound_handler.call1((py_messages,))?;
+                            match pyo3_async_runtimes::tokio::into_future(res.clone()) {
+                                Ok(fut) => Ok(Some(fut)),
+                                Err(e) => {
+                                    if let Ok(close_fn) = res.getattr(pyo3::intern!(py, "close")) {
+                                        let _ = close_fn.call0();
+                                        Err(e)
+                                    } else {
+                                        Ok(None)
+                                    }
+                                }
+                            }
+                        });
+
+                        match py_future_res {
+                            Some(Ok(Some(fut))) => match fut.await {
+                                Ok(_) => {
+                                    for tx in ack_txs {
+                                        let _ = tx.send(Ok(()));
+                                    }
+                                }
+                                Err(e) => {
+                                    let err_msg = e.to_string();
+                                    for tx in ack_txs {
+                                        let _ = tx.send(Err(Box::new(std::io::Error::other(err_msg.clone()))));
+                                    }
+                                }
+                            },
+                            Some(Ok(None)) => {
+                                for tx in ack_txs {
+                                    let _ = tx.send(Ok(()));
+                                }
+                            }
+                            Some(Err(e)) => {
+                                let err_msg = format!("Failed to execute Python callback: {}", e);
+                                for tx in ack_txs {
+                                    let _ = tx.send(Err(Box::new(std::io::Error::other(err_msg.clone()))));
+                                }
+                            }
+                            None => {
+                                for tx in ack_txs {
+                                    let _ = tx.send(Err(Box::new(std::io::Error::other("Python runtime is finalizing or unavailable"))));
+                                }
+                            }
+                        }
+                    }));
+                }
+            });
+
+            let sub_tx = sub_tx.clone();
             match eventbus
                 .subscribe(
                     &exchange_name,
                     &routing_key,
                     move |body| {
-                        let handler_clone = handler.clone();
-                        let locals_clone = locals.clone();
+                        let tx = sub_tx.clone();
                         async move {
-                            pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                let future_result = Python::attach(|py| -> PyResult<_> {
-                                    let bound_handler = handler_clone.bind(py);
-                                    let coro = bound_handler.call1((Message::from(body),))?;
-
-                                    pyo3_async_runtimes::tokio::into_future(coro)
-                                });
-                                match future_result {
-                                    Ok(py_future) => match py_future.await {
-                                        Ok(_) => Ok(()),
-                                        Err(e) => Err(Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            e.to_string(),
-                                        ))
-                                            as Box<dyn std::error::Error + Send + Sync>),
-                                    },
-                                    Err(e) => Err(Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("Failed to execute Python callback: {}", e),
-                                    ))
-                                        as Box<dyn std::error::Error + Send + Sync>),
-                                }
-                            })
-                            .await
+                            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+                            if tx.send(SubItem { message: body, ack_tx }).await.is_err() {
+                                return Err(Box::new(std::io::Error::other("Subscription channel closed")) as _);
+                            }
+                            match ack_rx.await {
+                                Ok(res) => res,
+                                Err(_) => Err(Box::new(std::io::Error::other("Ack channel dropped")) as _),
+                            }
                         }
                     },
                     process_timeout,
@@ -497,44 +770,72 @@ impl AsyncEventbus {
                         let handler_clone = handler.clone();
                         let locals_clone = locals.clone();
                         async move {
-                            pyo3_async_runtimes::tokio::scope(locals_clone, async move {
-                                let py_future_result = Python::attach(|py| -> PyResult<_> {
+                            let py_future_result =
+                                match Python::try_attach(|py| -> PyResult<_> {
                                     let bound_handler = handler_clone.bind(py);
                                     let coro = bound_handler.call1((Message::from(body),))?;
-
-                                    // Now into_future will successfully find the asyncio loop!
-                                    pyo3_async_runtimes::tokio::into_future(coro)
-                                });
-                                match py_future_result {
-                                    Ok(py_future) => match py_future.await {
-                                        Ok(result) => {
-                                            Python::attach(|py| {
-                                                if let Ok(message) = result.extract::<Message>(py) {
-                                                    return Ok(RuMessage::from(message));
-                                                }
-                                            match result.cast_bound::<PyBytes>(py) {
-                                                Ok(bytes) => Ok( RuMessage { body: bytes.as_bytes().into(), content_type: None }),
-                                                Err(_) => Err(Box::new(std::io::Error::new(
-                                                    std::io::ErrorKind::InvalidData,
-                                                    "RPC handler must return bytes",
-                                                ))
-                                                    as Box<dyn std::error::Error + Send + Sync>),
-                                            }
-                                        })},
-                                        Err(e) => Err(Box::new(std::io::Error::new(
-                                            std::io::ErrorKind::Other,
-                                            e.to_string(),
+                                    pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
+                                }) {
+                                    Some(res) => res,
+                                    None => {
+                                        return Err(Box::new(std::io::Error::other(
+                                            "Python runtime is finalizing or unavailable",
                                         ))
-                                            as Box<dyn std::error::Error + Send + Sync>),
-                                    },
-                                    Err(e) => Err(Box::new(std::io::Error::new(
-                                        std::io::ErrorKind::Other,
-                                        format!("Failed to execute Python callback: {}", e),
+                                            as Box<dyn std::error::Error + Send + Sync>);
+                                    }
+                                };
+                            match py_future_result {
+                                Ok(py_future) => match py_future.await {
+                                    Ok(result) => {
+                                        match Python::try_attach(|py| {
+                                            let bound = result.bind(py);
+                                            if let Ok(bytes) = bound.cast::<PyBytes>() {
+                                                let body: Arc<[u8]> = bytes.as_bytes().into();
+                                                Ok(RuMessage {
+                                                    body,
+                                                    content_type: None,
+                                                })
+                                            } else if let Ok(msg_ref) = bound.cast::<Message>() {
+                                                Ok(RuMessage::from(msg_ref.get()))
+                                            } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
+                                                let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
+                                                Ok(RuMessage {
+                                                    body,
+                                                    content_type: None,
+                                                })
+                                            } else if let Ok(py_str) = bound.cast::<pyo3::types::PyString>() {
+                                                let body: Arc<[u8]> = py_str.to_str()?.as_bytes().into();
+                                                Ok(RuMessage {
+                                                    body,
+                                                    content_type: Some("text/plain".to_string()),
+                                                })
+                                            } else {
+                                                Err(Box::new(std::io::Error::new(
+                                                    std::io::ErrorKind::InvalidData,
+                                                    "RPC handler must return bytes, bytearray, str, or Message",
+                                                ))
+                                                    as Box<
+                                                        dyn std::error::Error + Send + Sync,
+                                                    >)
+                                            }
+                                        }) {
+                                            Some(res) => res,
+                                            None => Err(Box::new(std::io::Error::other(
+                                                "Python runtime is finalizing or unavailable",
+                                            ))
+                                                as Box<dyn std::error::Error + Send + Sync>),
+                                        }
+                                    }
+                                    Err(e) => Err(Box::new(std::io::Error::other(
+                                        e.to_string(),
                                     ))
                                         as Box<dyn std::error::Error + Send + Sync>),
-                                }
-                            })
-                            .await
+                                },
+                                Err(e) => Err(Box::new(std::io::Error::other(
+                                    format!("Failed to execute Python callback: {}", e),
+                                ))
+                                    as Box<dyn std::error::Error + Send + Sync>),
+                            }
                         }
                     },
                     process_timeout,
@@ -548,30 +849,43 @@ impl AsyncEventbus {
         })
     }
     fn dispose(slf: PyRef<'_, Self>) -> PyResult<Bound<'_, PyAny>> {
-        let eventbus = Arc::clone(&slf.eventbus); // Clone the Arc for the async move
+        let eventbus = Arc::clone(&slf.eventbus);
         let py = slf.py();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            eventbus.dispose().await.map_err(|_| {
-                AppError {
-                    description: None,
-                    message: None,
-                    error_type: amqp_client_rust::errors::AppErrorType::UnexpectedResultError,
-                }
-                .into()
-            })
+            eventbus
+                .dispose()
+                .await
+                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
         })
     }
 }
 
 #[pymodule]
 fn amqp_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    if let Ok(val) = std::env::var("TOKIO_WORKER_THREADS")
+        && let Ok(threads) = val.parse::<usize>()
+        && threads > 0
+    {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all();
+        builder.worker_threads(threads);
+        pyo3_async_runtimes::tokio::init(builder);
+    }
+
+    m.add_function(wrap_pyfunction!(init_tokio, m)?)?;
     m.add_class::<AsyncEventbus>()?;
+    m.add_class::<AsyncConnection>()?;
     m.add_class::<Config>()?;
     m.add_class::<ConfigOptions>()?;
     m.add_class::<QoSConfig>()?;
     m.add_class::<TlsAdaptor>()?;
     m.add_class::<ContentEncoding>()?;
     m.add_class::<Message>()?;
+    m.add_class::<DeliveryMode>()?;
+    m.add_class::<QueueOptions>()?;
+    m.add_class::<PublishConfirmations>()?;
+    m.add_class::<BatchConfig>()?;
+    m.add_class::<DeliveryAck>()?;
     Ok(())
 }

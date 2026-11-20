@@ -37,10 +37,9 @@ async def test_provider_error():
     routing_key = "abc.example"
     body = dumps(["hi"])
     await eventbus.provide_resource(routing_key, handle)
-    result = await eventbus.rpc_client(options.rpc_exchange_name, routing_key, body, "application/json", ContentEncoding.Null)
+    with pytest.raises(Exception, match="RPC server returned error"):
+        await eventbus.rpc_client(options.rpc_exchange_name, routing_key, body, "application/json", ContentEncoding.Null)
     assert future.done()
     assert future.result() == expected_result
-    print(result)
-    assert result == bytes("Exception: ('errorad', 'adasd')", "utf-8")
     await eventbus.dispose()
     

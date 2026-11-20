@@ -1,16 +1,25 @@
-from typing import Callable, Optional, Awaitable, Union
+from typing import Callable, Optional, Awaitable, Union, Sequence
 from concurrent.futures import Future
 from enum import Enum
 
+PayloadType = Union[bytes, str, bytearray, "Message"]
+
+
+def init_tokio(worker_threads: Optional[int] = None) -> None: ...
+
 
 class Message:
-    body: bytes
+    @property
+    def body(self) -> bytes: ...
     content_type: Optional[str]
 
-    @staticmethod
-    def new(body: bytes, content_type: Optional[str] = None) -> "Message": ...
+    def __init__(self, body: PayloadType, content_type: Optional[str] = None) -> None: ...
 
-    
+    @staticmethod
+    def new(body: PayloadType, content_type: Optional[str] = None) -> "Message": ...
+
+    def memoryview(self) -> memoryview: ...
+    def __buffer__(self, flags: int) -> memoryview: ...
 
 class DeliveryMode(Enum):
     Transient = 1
@@ -22,11 +31,41 @@ class ContentEncoding(Enum):
     Zlib = 'zlib',
     Null = 'null'
 
+class BatchConfig:
+    enabled: bool
+    max_batch_size: int
+    max_delay_ms: int
+    max_payload_bytes: int
+    def __init__(self, enabled: bool = True, max_batch_size: int = 100, max_delay_ms: int = 0, max_payload_bytes: int = 1024) -> None: ...
+    @staticmethod
+    def default() -> "BatchConfig": ...
+
+class DeliveryAck:
+    def ack(self) -> None: ...
+    def nack(self, err: Optional[str] = None) -> None: ...
+
 class ConfigOptions:
     queue_name: str
     rpc_exchange_name: str
     rpc_queue_name: str
-    def __init__(self, queue_name: str, rpc_exchange_name: str, rpc_queue_name: str) -> None: ...
+    dead_letter_exchange: Optional[str]
+    dead_letter_routing_key: Optional[str]
+    batch_config: Optional[BatchConfig]
+    max_pending_commands: Optional[int]
+    max_pending_bytes: Optional[int]
+    fail_fast_on_disconnect: Optional[bool]
+    def __init__(
+        self,
+        queue_name: str,
+        rpc_exchange_name: str,
+        rpc_queue_name: str,
+        dead_letter_exchange: Optional[str] = None,
+        dead_letter_routing_key: Optional[str] = None,
+        batch_config: Optional[BatchConfig] = None,
+        max_pending_commands: Optional[int] = None,
+        max_pending_bytes: Optional[int] = None,
+        fail_fast_on_disconnect: Optional[bool] = None,
+    ) -> None: ...
 
 class TlsAdaptor:
     @staticmethod
@@ -89,7 +128,15 @@ class QoSConfig:
     
 
 class AsyncEventbus:
-    def __init__(self, config: Config, qos_config: QoSConfig) -> None:
+    @property
+    def batch_config(self) -> BatchConfig: ...
+
+    def __init__(
+        self,
+        config: Config,
+        qos_config: QoSConfig,
+        batch_config: Optional[Union[bool, BatchConfig]] = None,
+    ) -> None: ...
         """
         Create an AsyncEventbus object thats interacts with Bus
         thats provides some connection management abstractions.
@@ -123,7 +170,7 @@ class AsyncEventbus:
         self, 
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: Optional[str] = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         publish_timeout: int = 16,
@@ -163,11 +210,26 @@ class AsyncEventbus:
         """
         ...
 
+    def publish_batch(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        messages: Sequence[PayloadType],
+        content_type: Optional[str] = "application/json",
+        content_encoding: ContentEncoding = ContentEncoding.Null,
+        publish_timeout: int = 16,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+    ) -> Future[None]:
+        """
+        Sends a batch of messages to the bus in a single FFI crossing.
+        """
+        ...
+
     def rpc_client(
         self, 
         exchange_name: str,
         routing_key: str,
-        body: Union[bytes, str],
+        body: PayloadType,
         content_type: str = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         response_timeout: int = 20_000,
@@ -210,9 +272,10 @@ class AsyncEventbus:
         self,
         exchange_name: str,
         routing_key: str,
-        handler: Callable[[bytes], None],
+        handler: Callable[[Message], Any],
         process_timeout: Optional[int] = None,
         command_timeout: int = 16,
+        batch_dispatch: Optional[bool] = None,
     ) -> Future[None]:
         """
         Register a provider to listen on queue of bus
@@ -223,17 +286,35 @@ class AsyncEventbus:
             handler: message handler, it will be called when a message is received
             process_timeout: timeout in seconds for waiting for process the received message
             command_timeout: timeout for waiting for command execution
+            batch_dispatch: optional override to enable/disable FFI batch dispatching
         Returns:
             None: None
+        """
+        ...
 
-        Examples:
-            >>> async def handle(body) -> None:
-                    print(f"received message: {body}")
-            >>> exchange_name = "example"
-            >>> routing_key = "user.find3"
-            >>> process_timeout = 20
-            >>> command_timeout = 16
-            >>> await eventbus.subscribe(exchange_name, routing_key, handle, process_timeout, command_timeout)
+    def subscribe_batch(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        handler: Callable[[list[Message]], Any],
+        batch_size: int = 100,
+        max_delay_ms: int = 0,
+        process_timeout: Optional[int] = None,
+        command_timeout: int = 16,
+    ) -> Future[None]:
+        """
+        Register a batch provider to receive batches of messages directly.
+
+        Args:
+            exchange_name: exchange name
+            routing_key: routing_key name
+            handler: batch handler receiving list[Message]
+            batch_size: maximum number of messages per batch
+            max_delay_ms: maximum delay in ms to wait for batch assembly
+            process_timeout: timeout in seconds for waiting for process the received message
+            command_timeout: timeout for waiting for command execution
+        Returns:
+            None: None
         """
         ...
 
@@ -272,3 +353,92 @@ class AsyncEventbus:
 
 class Payload:
     def __init__(self, data: bytes) -> None: ...
+
+class PublishConfirmations(Enum):
+    Disables = 0
+    PublisherConfirms = 1
+    RPCClientPublisherConfirms = 2
+    RPCServerPublisherConfirms = 3
+
+class QueueOptions:
+    auto_delete: bool
+    durable: bool
+    exclusive: bool
+    no_create: bool
+    arguments: dict[str, str]
+
+    def __init__(
+        self,
+        auto_delete: bool,
+        durable: bool,
+        exclusive: bool,
+        no_create: bool,
+        arguments: dict[str, str],
+    ) -> None: ...
+
+class AsyncConnection:
+    def __init__(
+        self,
+        config: Config,
+        publish_confirmations: PublishConfirmations,
+        auto_ack: bool,
+        prefetch_count: Optional[int] = None,
+    ) -> None: ...
+
+    def publish(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        body: PayloadType,
+        content_type: str,
+        content_encoding: ContentEncoding,
+        command_timeout: Optional[int] = None,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+        expiration: Optional[int] = None,
+    ) -> Future[None]: ...
+
+    def subscribe(
+        self,
+        handler: Callable[[Message], Awaitable[None]],
+        routing_key: str,
+        exchange_name: str,
+        exchange_type: str,
+        queue_name: str,
+        process_timeout: Optional[int] = None,
+        command_timeout: Optional[int] = None,
+        queue_options: QueueOptions = ...,
+    ) -> Future[None]: ...
+
+    def rpc_server(
+        self,
+        handler: Callable[[Message], Awaitable[Union[Message, bytes, bytearray, str]]],
+        routing_key: str,
+        exchange_name: str,
+        exchange_type: str,
+        queue_name: str,
+        process_timeout: Optional[int] = None,
+        command_timeout: Optional[int] = None,
+        queue_options: QueueOptions = ...,
+    ) -> Future[None]: ...
+
+    def rpc_client(
+        self,
+        exchange_name: str,
+        routing_key: str,
+        body: PayloadType,
+        content_type: str,
+        content_encoding: ContentEncoding,
+        response_timeout_millis: int,
+        command_timeout: Optional[int] = None,
+        delivery_mode: DeliveryMode = DeliveryMode.Transient,
+        expiration: Optional[int] = None,
+    ) -> Future[bytes]: ...
+
+    def update_secret(
+        self,
+        new_secret: str,
+        reason: str,
+        command_timeout: Optional[int] = None,
+    ) -> Future[None]: ...
+
+    def close(self) -> Future[None]: ...

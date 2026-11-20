@@ -1,6 +1,6 @@
 {
   "name": "amqp-rs",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Node.js AMQP Client Library developed in Rust using N-API.",
   "main": "index.js",
   "repository": {
@@ -66,21 +66,21 @@
     "prepare": "husky"
   },
   "devDependencies": {
-    "@emnapi/core": "^1.5.0",
-    "@emnapi/runtime": "^1.5.0",
-    "@napi-rs/cli": "^3.2.0",
+    "@emnapi/core": "^1.11.3",
+    "@emnapi/runtime": "^1.11.3",
+    "@napi-rs/cli": "^3.8.6",
     "@oxc-node/core": "^0.0.35",
     "@taplo/cli": "^0.7.0",
-    "@tybys/wasm-util": "^0.10.0",
+    "@tybys/wasm-util": "^0.10.3",
     "ava": "^7.0.0",
     "chalk": "^5.6.2",
     "husky": "^9.1.7",
-    "lint-staged": "^16.1.6",
+    "lint-staged": "^16.4.0",
     "npm-run-all2": "^8.0.4",
-    "oxlint": "^1.14.0",
-    "prettier": "^3.6.2",
-    "tinybench": "^6.0.0",
-    "typescript": "^5.9.2"
+    "oxlint": "^1.79.0",
+    "prettier": "^3.9.6",
+    "tinybench": "^6.1.3",
+    "typescript": "^5.9.3"
   },
   "lint-staged": {
     "*.@(js|ts|tsx)": [
@@ -115,7 +115,5 @@
     "arrowParens": "always"
   },
   "packageManager": "yarn@4.12.0",
-  "dependencies": {
-    "amqp-client-node": "^1.0.11"
-  }
+  "dependencies": {}
 }
