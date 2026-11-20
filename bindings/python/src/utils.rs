@@ -136,12 +136,16 @@ impl From<Message> for RuMessage {
 
 #[pymethods]
 impl Message {
+    #[new]
+    #[pyo3(signature = (body, content_type=None))]
+    fn py_new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
+        Self::new(body, content_type)
+    }
+
     #[staticmethod]
+    #[pyo3(signature = (body, content_type=None))]
     fn new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
-        let body: Arc<[u8]> = match body {
-            Payload::Bytes(b) => b.as_bytes().into(),
-            Payload::Str(s) => s.to_str()?.as_bytes().into(),
-        };
+        let body: Arc<[u8]> = body.as_bytes()?.into();
         Ok(Self {
             body,
             content_type,
@@ -156,6 +160,19 @@ impl Message {
             PyBytes::new(py, &slf.body).unbind()
         });
         cached.bind(py).clone()
+    }
+
+    fn memoryview<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
+        let py = slf.py();
+        unsafe {
+            let ptr = pyo3::ffi::PyMemoryView_FromObject(slf.as_ptr());
+            if ptr.is_null() {
+                return Err(PyErr::take(py).unwrap_or_else(|| {
+                    pyo3::exceptions::PyBufferError::new_err("Failed to create memoryview")
+                }));
+            }
+            Bound::from_owned_ptr(py, ptr).cast_into::<pyo3::types::PyMemoryView>().map_err(|e| e.into())
+        }
     }
 
     #[getter]
@@ -180,7 +197,9 @@ impl Message {
             )
         };
         if ret == -1 {
-            return Err(PyErr::fetch(slf.py()));
+            return Err(PyErr::take(slf.py()).unwrap_or_else(|| {
+                pyo3::exceptions::PyBufferError::new_err("Buffer fill info failed")
+            }));
         }
         Ok(())
     }
@@ -517,4 +536,25 @@ impl From<QoSConfig> for RuQoSConfig {
 pub enum Payload<'py> {
     Bytes(Bound<'py, PyBytes>),
     Str(Bound<'py, PyString>),
+    ByteArray(Bound<'py, pyo3::types::PyByteArray>),
+}
+
+impl<'py> Payload<'py> {
+    #[inline]
+    pub fn as_bytes(&self) -> PyResult<&[u8]> {
+        match self {
+            Payload::Bytes(b) => Ok(b.as_bytes()),
+            Payload::Str(s) => Ok(s.to_str()?.as_bytes()),
+            Payload::ByteArray(ba) => Ok(unsafe { ba.as_bytes() }),
+        }
+    }
+
+    #[inline]
+    pub fn into_vec(self) -> PyResult<Vec<u8>> {
+        match self {
+            Payload::Bytes(b) => Ok(b.as_bytes().to_vec()),
+            Payload::Str(s) => Ok(s.to_str()?.as_bytes().to_vec()),
+            Payload::ByteArray(ba) => Ok(unsafe { ba.as_bytes().to_vec() }),
+        }
+    }
 }

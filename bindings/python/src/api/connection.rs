@@ -56,10 +56,7 @@ impl AsyncConnection {
         let conn = Arc::clone(&slf.inner);
         let exchange_name = exchange_name.to_owned();
         let routing_key = routing_key.to_owned();
-        let payload_bytes = match body {
-            Payload::Bytes(b) => b.as_bytes().to_vec(),
-            Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
-        };
+        let payload_bytes = body.into_vec()?;
         let content_type = content_type.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -231,19 +228,33 @@ impl AsyncConnection {
                         Ok(py_future) => match py_future.await {
                             Ok(result) => {
                                 match Python::try_attach(|py| {
-                                    if let Ok(message) = result.extract::<Message>(py) {
-                                        return Ok(RuMessage::from(message));
-                                    }
-                                    match result.cast_bound::<PyBytes>(py) {
-                                        Ok(bytes) => Ok(RuMessage {
-                                            body: bytes.as_bytes().into(),
+                                    let bound = result.bind(py);
+                                    if let Ok(bytes) = bound.cast::<PyBytes>() {
+                                        let body: Arc<[u8]> = bytes.as_bytes().into();
+                                        Ok(RuMessage {
+                                            body,
                                             content_type: None,
-                                        }),
-                                        Err(_) => Err(Box::new(std::io::Error::new(
+                                        })
+                                    } else if let Ok(message) = bound.extract::<Message>() {
+                                        Ok(RuMessage::from(message))
+                                    } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
+                                        let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
+                                        Ok(RuMessage {
+                                            body,
+                                            content_type: None,
+                                        })
+                                    } else if let Ok(py_str) = bound.cast::<pyo3::types::PyString>() {
+                                        let body: Arc<[u8]> = py_str.to_str()?.as_bytes().into();
+                                        Ok(RuMessage {
+                                            body,
+                                            content_type: Some("text/plain".to_string()),
+                                        })
+                                    } else {
+                                        Err(Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
-                                            "RPC handler must return bytes",
+                                            "RPC handler must return bytes, bytearray, str, or Message",
                                         ))
-                                            as Box<dyn std::error::Error + Send + Sync>),
+                                            as Box<dyn std::error::Error + Send + Sync>)
                                     }
                                 }) {
                                     Some(res) => res,
@@ -321,10 +332,7 @@ impl AsyncConnection {
         let conn = Arc::clone(&slf.inner);
         let exchange_name = exchange_name.to_owned();
         let routing_key = routing_key.to_owned();
-        let payload_bytes = match body {
-            Payload::Bytes(b) => b.as_bytes().to_vec(),
-            Payload::Str(s) => s.to_str()?.as_bytes().to_vec(),
-        };
+        let payload_bytes = body.into_vec()?;
         let content_type = content_type.to_owned();
         let command_timeout = command_timeout.map(std::time::Duration::from_secs);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

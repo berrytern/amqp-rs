@@ -48,3 +48,39 @@ async def test_max_pending_commands_zero():
         await bus.publish('ex', 'rk', b'test', 'text/plain', ContentEncoding.Null, 100)
     assert 'Connection is unavailable' in str(exc_info.value)
     await bus.dispose()
+
+def test_message_memoryview_and_constructor():
+    m = Message(b'test buffer view', 'text/plain')
+    assert m.body == b'test buffer view'
+    assert m.content_type == 'text/plain'
+    mv = m.memoryview()
+    assert isinstance(mv, memoryview)
+    assert bytes(mv) == b'test buffer view'
+    assert memoryview(m).tobytes() == b'test buffer view'
+
+    m_ba = Message.new(bytearray(b'bytearray buffer'), 'application/octet-stream')
+    assert m_ba.body == b'bytearray buffer'
+    assert m_ba.memoryview().tobytes() == b'bytearray buffer'
+
+@pytest.mark.asyncio
+async def test_publish_bytearray():
+    future = Future(loop=get_running_loop())
+    options = ConfigOptions(queue_name='test_ba_q', rpc_exchange_name='test_ba_ex', rpc_queue_name='test_ba_rq')
+    eventbus = AsyncEventbus(Config(host='localhost', port=5672, username='guest', password='guest', virtual_host='/', options=options, tls_adaptor=None), QoSConfig(pub_confirm=True, rpc_client_confirm=True, rpc_server_confirm=True, sub_auto_ack=True, rpc_server_auto_ack=True, rpc_client_auto_ack=True))
+    
+    async def handle(body: Message):
+        if not future.done():
+            future.set_result(body)
+
+    exchange_name = "test_ba"
+    routing_key = "test_ba.action"
+    message = bytearray(b"bytearray payload content")
+    await eventbus.subscribe(exchange_name, routing_key, handle, None, None)
+    await eventbus.publish(exchange_name, routing_key, message, "application/octet-stream", ContentEncoding.Null, None)
+    await future
+    assert future.done()
+    response: Message = future.result()
+    assert isinstance(response, Message)
+    assert response.body == bytes(message)
+    await eventbus.dispose()
+
