@@ -14,7 +14,7 @@ use amqp_client_rust::api::{
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use std::{pin::Pin, sync::Arc};
 
-#[pyclass(skip_from_py_object)]
+#[pyclass]
 pub struct AsyncConnection {
     pub(crate) inner: Arc<RuAsyncConnection>,
 }
