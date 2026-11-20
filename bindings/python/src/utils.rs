@@ -98,6 +98,7 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
     }
 }
 
+/// AMQP message container supporting zero-copy payload buffer protocol (PEP 3118).
 #[pyclass(frozen, from_py_object)]
 #[derive(Debug)]
 pub struct Message {
@@ -144,12 +145,14 @@ impl From<&Message> for RuMessage {
 
 #[pymethods]
 impl Message {
+    /// Create a new Message instance with optional content type.
     #[new]
     #[pyo3(signature = (body, content_type=None))]
     fn py_new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
         Self::new(body, content_type)
     }
 
+    /// Create a new Message instance with optional content type.
     #[staticmethod]
     #[pyo3(signature = (body, content_type=None))]
     fn new<'py>(body: Payload<'py>, content_type: Option<String>) -> PyResult<Self> {
@@ -162,6 +165,7 @@ impl Message {
         })
     }
 
+    /// Return the message body as bytes (cached on first access).
     #[getter]
     fn body<'py>(slf: PyRef<'py, Self>) -> Bound<'py, PyBytes> {
         let py = slf.py();
@@ -171,6 +175,7 @@ impl Message {
         cached.bind(py).clone()
     }
 
+    /// Return a zero-copy memoryview (PEP 3118) of the underlying payload buffer.
     fn memoryview<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
         let py = slf.py();
         unsafe {
@@ -184,6 +189,7 @@ impl Message {
         }
     }
 
+    /// Return the optional message content type.
     #[getter]
     fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()

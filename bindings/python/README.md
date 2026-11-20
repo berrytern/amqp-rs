@@ -8,50 +8,139 @@
     <img src="https://img.shields.io/pypi/pyversions/amqp-rs.svg?color=%2334D058" alt="Supported Python versions">
 </a>
 
-**amqp-rs** is a Python client library with a high level of abstraction for manipulating messages in RabbitMQ.
+**amqp-rs** is a high-performance Python AMQP client library developed in Rust using PyO3 and Tokio. It provides native asynchronous primitives for RabbitMQ with zero-copy buffer capabilities, resilient connection actors, and automated resource declaration.
 
 ---
 
-### What is "amqprs"
-It is a Python extension developed in Rust using PyO3. It acts as a wrapper for the [amqp-client-rust](https://github.com/berrytern/amqp-client-rust) library, inheriting its performance, stability, and asynchronous capabilities.
+## Features
 
-### Features
-- **Thread Safe**: Built on Rust's memory safety guarantees.
-- **Asynchronous API**: Powered by `tokio` and `pyo3-asyncio` for high-performance I/O.
-- **Automatic Management**: Handles the creation and management of queues, exchanges, and channels automatically.
-- **Persistence**: Built-in connection persistence and automatic reconnection.
-- **Flexible Exchanges**: Full support for direct, topic, and fanout exchange types.
-- **RPC Support**: Native abstractions for Remote Procedure Calls (RPC).
-- **Compression**: Built-in support for `zstd`, `zlib`, and `lz4` encoding.
-- **TLS/SSL**: Robust encryption support including mutual TLS (client authentication).
-- **Graceful Shutdown**: Ability to stop consumers cleanly and process remaining messages before closing.
+- **Asynchronous & Thread-Safe**: Powered by Tokio and PyO3 with full support for CPython 3.8+ including Free-Threaded Python (no-GIL 3.13t / 3.14t).
+- **Zero-Copy Buffer Protocol (PEP 3118)**: Native `Message` class implements Python's buffer protocol (`memoryview(msg)` / `msg.memoryview()`), eliminating memory copies when integrating with binary parsers or serializers like `orjson`.
+- **Zero-Allocation Message Re-use**: Direct `Message` support in `publish()` and `rpc_client()` sharing underlying Rust `Arc<[u8]>` payloads without FFI re-allocation.
+- **Automatic Resource Declaration**: Declarative setup for exchanges, queues, and Dead Letter Exchanges (DLQ).
+- **Pub/Sub & Auto-Batching**: High-throughput message streaming with optional transparent micro-batching (`BatchConfig`) to amortize FFI crossings.
+- **RPC Client & Server**: Low-latency bidirectional Remote Procedure Calls using direct reply-to with correlation ID tracking.
+- **Compression**: Native payload compression for `zstd`, `zlib`, and `lz4`.
+- **TLS/SSL Support**: Encrypted communication with mutual TLS support.
+- **Graceful Shutdown**: Drain consumers cleanly without message loss.
 
 ---
 
-### Installation
-
-You can install `amqp-rs` directly from PyPI using `uv` or `pip`:
+## Installation
 
 ```bash
 uv add amqp-rs
+# or
+pip install amqp-rs
 ```
 
-### Configuration
-The library uses specialized objects to manage connection behavior and Quality of Service (QoS):
+---
 
+## Quickstart
 
-#### Connection Settings
+### 1. Publishing & Subscribing (Pub/Sub)
 
-- `ConfigOptions`: Defines primary queue names and RPC exchange/queue settings.
+```python
+import asyncio
+from amqp_rs import (
+    AsyncEventbus,
+    Config,
+    ConfigOptions,
+    ContentEncoding,
+    Message,
+    QoSConfig,
+)
 
-- `Config`: Contains connection parameters such as `host`, `port`, `username`, `password`, and `virtual_host`.
+async def main():
+    options = ConfigOptions(
+        queue_name="orders_queue",
+        rpc_exchange_name="rpc_ex",
+        rpc_queue_name="rpc_q",
+    )
+    config = Config("localhost", 5672, "guest", "guest", "/", options=options)
+    bus = AsyncEventbus(config, QoSConfig.default())
 
-#### QoS and Confirmations (`QoSConfig`)
+    # Subscribe to a topic
+    async def order_handler(msg: Message):
+        # Zero-copy access via memoryview or bytes property (cached)
+        payload = msg.body
+        print(f"Received order: {payload.decode('utf-8')}")
 
-You can fine-tune performance and reliability using QoSConfig:
+    await bus.subscribe("orders_exchange", "orders.created", order_handler)
 
-- Confirmations: Enable or disable publisher confirmations for standard publishing or RPC (`pub_confirm`, `rpc_client_confirm`, `rpc_server_confirm`).
+    # Publish an event (accepts bytes, str, bytearray, or Message)
+    await bus.publish(
+        "orders_exchange",
+        "orders.created",
+        b'{"order_id": 42, "item": "laptop"}',
+        content_type="application/json",
+    )
 
-- Acknowledge: Set automatic acknowledgement for subscriptions or RPC handlers (`sub_auto_ack`, `rpc_server_auto_ack`).
+    await asyncio.sleep(1)
+    await bus.dispose()
 
-- Prefetch: Control the flow by setting prefetch counts for different connection types to manage how many unacknowledged messages the client can hold.
+asyncio.run(main())
+```
+
+---
+
+### 2. High-Performance Zero-Copy Handling
+
+For high-throughput applications handling large payloads, access the payload via `msg.memoryview()` or pass `msg` directly to buffer-compatible parsers:
+
+```python
+import orjson
+from amqp_rs import Message
+
+async def fast_handler(msg: Message):
+    # Zero-copy parsing directly from the Rust buffer:
+    data = orjson.loads(msg.memoryview())
+    # Or pass msg directly (PEP 3118 buffer protocol):
+    # data = orjson.loads(msg)
+```
+
+---
+
+### 3. Remote Procedure Calls (RPC)
+
+```python
+async def rpc_example():
+    # RPC Server
+    async def handle_rpc(request: Message):
+        print(f"RPC Request: {request.body}")
+        return b'{"status": "ok"}'
+
+    await bus.provide_resource("user.get", handle_rpc)
+
+    # RPC Client
+    response = await bus.rpc_client(
+        "rpc_ex",
+        "user.get",
+        b'{"user_id": 1}',
+    )
+    print(f"RPC Response: {response}")
+```
+
+---
+
+### 4. Auto-Batching for High-Throughput Publishing
+
+When publishing thousands of small messages concurrently, enable `BatchConfig` to amortize FFI crossings automatically:
+
+```python
+from amqp_rs import BatchConfig
+
+batch_cfg = BatchConfig(
+    enabled=True,
+    max_batch_size=100,
+    max_delay_ms=2,
+    max_payload_bytes=1024,
+)
+bus = AsyncEventbus(config, QoSConfig.default(), batch_config=batch_cfg)
+```
+
+---
+
+## License
+
+This project is licensed under the [Apache 2.0 License](LICENSE).
