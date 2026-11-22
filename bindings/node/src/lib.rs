@@ -1,12 +1,14 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use amqp_client_rust::{
   amqprs::tls::TlsAdaptor as RuTlsAdaptor,
   api::{
     eventbus::AsyncEventbusRabbitMQ as RuAsyncEventbusRabbitMQ,
     utils::{
-      ContentEncoding as RuContentEncoding, DeliveryMode as RuDeliveryMode, Message as RuMessage,
-      PublishOptions as RuPublishOptions, RpcClientOptions as RuRpcClientOptions,
+      ContentEncoding as RuContentEncoding, DeliveryMode as RuDeliveryMode,
+      ExchangeOptions as RuExchangeOptions, ExchangeType as RuExchangeType,
+      Message as RuMessage, PublishOptions as RuPublishOptions, QueueOptions as RuQueueOptions,
+      RpcClientOptions as RuRpcClientOptions, Topology as RuTopology,
     },
   },
   domain::config::{
@@ -59,17 +61,186 @@ impl From<ContentEncoding> for RuContentEncoding {
   }
 }
 
+#[napi(string_enum)]
+#[derive(Debug, Clone, Copy)]
+pub enum ExchangeType {
+  Direct,
+  Fanout,
+  Topic,
+  Headers,
+}
+
+impl From<ExchangeType> for RuExchangeType {
+  fn from(val: ExchangeType) -> Self {
+    match val {
+      ExchangeType::Direct => RuExchangeType::Direct,
+      ExchangeType::Fanout => RuExchangeType::Fanout,
+      ExchangeType::Topic => RuExchangeType::Topic,
+      ExchangeType::Headers => RuExchangeType::Headers,
+    }
+  }
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ExchangeOptions {
+  pub exchange_type: Option<ExchangeType>,
+  pub durable: Option<bool>,
+  pub auto_delete: Option<bool>,
+  pub internal: Option<bool>,
+  pub no_create: Option<bool>,
+}
+
+impl From<ExchangeOptions> for RuExchangeOptions {
+  fn from(opts: ExchangeOptions) -> Self {
+    RuExchangeOptions {
+      exchange_type: opts.exchange_type.map(Into::into).unwrap_or(RuExchangeType::Topic),
+      durable: opts.durable.unwrap_or(true),
+      auto_delete: opts.auto_delete.unwrap_or(false),
+      internal: opts.internal.unwrap_or(false),
+      no_create: opts.no_create.unwrap_or(false),
+    }
+  }
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct QueueOptions {
+  pub auto_delete: Option<bool>,
+  pub durable: Option<bool>,
+  pub exclusive: Option<bool>,
+  pub no_create: Option<bool>,
+  pub dead_letter_exchange: Option<String>,
+  pub dead_letter_routing_key: Option<String>,
+  pub message_ttl: Option<u32>,
+  pub expires: Option<u32>,
+  pub max_length: Option<u32>,
+  pub max_priority: Option<u8>,
+  pub arguments: Option<HashMap<String, String>>,
+}
+
+impl TryFrom<QueueOptions> for RuQueueOptions {
+  type Error = napi::Error;
+
+  fn try_from(opts: QueueOptions) -> std::result::Result<Self, Self::Error> {
+    let mut q = RuQueueOptions::new()
+      .auto_delete(opts.auto_delete.unwrap_or(false))
+      .durable(opts.durable.unwrap_or(true))
+      .exclusive(opts.exclusive.unwrap_or(false))
+      .no_create(opts.no_create.unwrap_or(false));
+    if let Some(dlx) = opts.dead_letter_exchange {
+      q = q.dead_letter_exchange(dlx);
+    }
+    if let Some(dlk) = opts.dead_letter_routing_key {
+      q = q.dead_letter_routing_key(dlk);
+    }
+    if let Some(ttl) = opts.message_ttl {
+      q = q.message_ttl(ttl);
+    }
+    if let Some(exp) = opts.expires {
+      q = q.expires(exp);
+    }
+    if let Some(max_len) = opts.max_length {
+      q = q.max_length(max_len);
+    }
+    if let Some(max_prio) = opts.max_priority {
+      q = q.max_priority(max_prio);
+    }
+    if let Some(args) = opts.arguments {
+      q = q.arguments(&args).map_err(|e| Error::new(Status::InvalidArg, e.to_string()))?;
+    }
+    Ok(q)
+  }
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct TopologyExchange {
+  pub name: String,
+  pub options: Option<ExchangeOptions>,
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct TopologyQueue {
+  pub name: String,
+  pub options: Option<QueueOptions>,
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct TopologyBinding {
+  pub queue_name: String,
+  pub exchange_name: String,
+  pub routing_key: String,
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct Topology {
+  pub exchanges: Option<Vec<TopologyExchange>>,
+  pub queues: Option<Vec<TopologyQueue>>,
+  pub bindings: Option<Vec<TopologyBinding>>,
+}
+
+impl TryFrom<Topology> for RuTopology {
+  type Error = napi::Error;
+
+  fn try_from(topo: Topology) -> std::result::Result<Self, Self::Error> {
+    let mut ru = RuTopology::new();
+    if let Some(exchanges) = topo.exchanges {
+      for ex in exchanges {
+        ru = ru.exchange(ex.name, ex.options.map(Into::into).unwrap_or_default());
+      }
+    }
+    if let Some(queues) = topo.queues {
+      for q in queues {
+        let ru_q = match q.options {
+          Some(opts) => RuQueueOptions::try_from(opts)?,
+          None => RuQueueOptions::new().durable(true),
+        };
+        ru = ru.queue(q.name, ru_q);
+      }
+    }
+    if let Some(bindings) = topo.bindings {
+      for b in bindings {
+        ru = ru.bind(b.queue_name, b.exchange_name, b.routing_key);
+      }
+    }
+    Ok(ru)
+  }
+}
+
 #[napi(object)]
 pub struct Message {
   pub body: Buffer,
   pub content_type: Option<String>,
+  pub routing_key: Option<String>,
+  pub exchange: Option<String>,
+  pub redelivered: Option<bool>,
+  pub delivery_tag: Option<i64>,
+  pub correlation_id: Option<String>,
+  pub message_id: Option<String>,
+  pub app_id: Option<String>,
+  pub timestamp: Option<i64>,
+  pub headers: Option<HashMap<String, String>>,
 }
 
 impl From<RuMessage> for Message {
   fn from(msg: RuMessage) -> Self {
+    let meta = msg.metadata.as_deref();
     Self {
       body: Buffer::from(msg.body.as_ref()),
       content_type: msg.content_type,
+      routing_key: meta.and_then(|m| m.routing_key().map(str::to_owned)),
+      exchange: meta.and_then(|m| m.exchange().map(str::to_owned)),
+      redelivered: meta.map(|m| m.redelivered()),
+      delivery_tag: meta.and_then(|m| m.delivery_tag().map(|t| t as i64)),
+      correlation_id: meta.and_then(|m| m.correlation_id().map(str::to_owned)),
+      message_id: meta.and_then(|m| m.message_id().map(str::to_owned)),
+      app_id: meta.and_then(|m| m.app_id().map(str::to_owned)),
+      timestamp: meta.and_then(|m| m.timestamp().map(|t| t as i64)),
+      headers: meta.and_then(|m| m.headers()),
     }
   }
 }
@@ -79,6 +250,7 @@ impl From<Message> for RuMessage {
     Self {
       body: msg.body.to_vec().into(),
       content_type: msg.content_type,
+      metadata: None,
     }
   }
 }
@@ -94,10 +266,22 @@ pub struct ConfigOptions {
   pub max_pending_commands: Option<u32>,
   pub max_pending_bytes: Option<u32>,
   pub fail_fast_on_disconnect: Option<bool>,
+  pub sub_exchange: Option<ExchangeOptions>,
+  pub sub_queue: Option<QueueOptions>,
+  pub rpc_exchange: Option<ExchangeOptions>,
+  pub rpc_queue: Option<QueueOptions>,
 }
 
 impl From<ConfigOptions> for RuConfigOptions {
   fn from(options: ConfigOptions) -> Self {
+    let sub_queue = options
+      .sub_queue
+      .and_then(|q| RuQueueOptions::try_from(q).ok())
+      .unwrap_or_else(|| RuQueueOptions::new().durable(true));
+    let rpc_queue = options
+      .rpc_queue
+      .and_then(|q| RuQueueOptions::try_from(q).ok())
+      .unwrap_or_else(|| RuQueueOptions::new().durable(true));
     Self {
       queue_name: options.queue_name,
       rpc_exchange_name: options.rpc_exchange_name,
@@ -109,6 +293,10 @@ impl From<ConfigOptions> for RuConfigOptions {
       fail_fast_on_disconnect: options.fail_fast_on_disconnect.unwrap_or(false),
       default_command_timeout: std::time::Duration::from_secs(16),
       max_reconnect_delay: 30,
+      sub_exchange: options.sub_exchange.map(Into::into).unwrap_or_else(RuExchangeOptions::topic),
+      sub_queue,
+      rpc_exchange: options.rpc_exchange.map(Into::into).unwrap_or_else(RuExchangeOptions::topic),
+      rpc_queue,
     }
   }
 }
@@ -266,6 +454,39 @@ impl AsyncEventbus {
         qos_config.into(),
       )),
     })
+  }
+
+  #[napi]
+  pub async fn declare_exchange(
+    &self,
+    exchange_name: String,
+    options: Option<ExchangeOptions>,
+    command_timeout: Option<u32>,
+  ) -> Result<()> {
+    let ru_opts = options.map(Into::into).unwrap_or_default();
+    let cmd_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+    self
+      .eventbus
+      .declare_exchange(&exchange_name, ru_opts, cmd_timeout)
+      .await
+      .map_err(AppError::from)?;
+    Ok(())
+  }
+
+  #[napi]
+  pub async fn declare_topology(
+    &self,
+    topology: Topology,
+    command_timeout: Option<u32>,
+  ) -> Result<()> {
+    let ru_topology = RuTopology::try_from(topology)?;
+    let cmd_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+    self
+      .eventbus
+      .declare_topology(ru_topology, cmd_timeout)
+      .await
+      .map_err(AppError::from)?;
+    Ok(())
   }
 
   #[napi]

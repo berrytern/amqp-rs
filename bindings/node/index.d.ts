@@ -2,6 +2,8 @@
 /* eslint-disable */
 export declare class AsyncEventbus {
   static connect(config: Config, qosConfig: QoSConfig): Promise<AsyncEventbus>
+  declareExchange(exchangeName: string, options?: ExchangeOptions | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
+  declareTopology(topology: Topology, commandTimeout?: number | undefined | null): Promise<void>
   publish(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string | undefined | null, contentEncoding: ContentEncoding, commandTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<void>
   rpcClient(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string, contentEncoding: ContentEncoding, responseTimeout: number, connectionTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<Buffer>
   subscribe(exchangeName: string, routingKey: string, handler: (msg: Message) => Promise<void>, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
@@ -27,6 +29,10 @@ export interface ConfigOptions {
   maxPendingCommands?: number
   maxPendingBytes?: number
   failFastOnDisconnect?: boolean
+  subExchange?: ExchangeOptions
+  subQueue?: QueueOptions
+  rpcExchange?: ExchangeOptions
+  rpcQueue?: QueueOptions
 }
 
 export declare const enum ContentEncoding {
@@ -41,9 +47,33 @@ export declare const enum DeliveryMode {
   Persistent = 2
 }
 
+export interface ExchangeOptions {
+  exchangeType?: ExchangeType
+  durable?: boolean
+  autoDelete?: boolean
+  internal?: boolean
+  noCreate?: boolean
+}
+
+export declare const enum ExchangeType {
+  Direct = 'Direct',
+  Fanout = 'Fanout',
+  Topic = 'Topic',
+  Headers = 'Headers'
+}
+
 export interface Message {
   body: Buffer
   contentType?: string
+  routingKey?: string
+  exchange?: string
+  redelivered?: boolean
+  deliveryTag?: number
+  correlationId?: string
+  messageId?: string
+  appId?: string
+  timestamp?: number
+  headers?: Record<string, string>
 }
 
 export interface QoSConfig {
@@ -56,4 +86,40 @@ export interface QoSConfig {
   subPrefetch?: number
   rpcServerPrefetch?: number
   rpcClientPrefetch?: number
+}
+
+export interface QueueOptions {
+  autoDelete?: boolean
+  durable?: boolean
+  exclusive?: boolean
+  noCreate?: boolean
+  deadLetterExchange?: string
+  deadLetterRoutingKey?: string
+  messageTtl?: number
+  expires?: number
+  maxLength?: number
+  maxPriority?: number
+  arguments?: Record<string, string>
+}
+
+export interface Topology {
+  exchanges?: Array<TopologyExchange>
+  queues?: Array<TopologyQueue>
+  bindings?: Array<TopologyBinding>
+}
+
+export interface TopologyBinding {
+  queueName: string
+  exchangeName: string
+  routingKey: string
+}
+
+export interface TopologyExchange {
+  name: string
+  options?: ExchangeOptions
+}
+
+export interface TopologyQueue {
+  name: string
+  options?: QueueOptions
 }

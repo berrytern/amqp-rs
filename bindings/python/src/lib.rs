@@ -11,13 +11,14 @@ pub use amqp_client_rust;
 pub mod api;
 pub mod exceptions;
 pub mod utils;
-use exceptions::AppError;
+use exceptions::{AppError, RequeueError, py_err_to_handler_error};
 
 use crate::{
     api::connection::AsyncConnection,
     utils::{
-        BatchConfig, Config, ConfigOptions, ContentEncoding, DeliveryAck, DeliveryMode, Message,
-        Payload, PublishConfirmations, QoSConfig, QueueOptions, TlsAdaptor,
+        BatchConfig, Config, ConfigOptions, ContentEncoding, DeliveryAck, DeliveryMode,
+        ExchangeOptions, ExchangeType, Message, Payload, PublishConfirmations, QoSConfig,
+        QueueOptions, TlsAdaptor, Topology,
     },
 };
 
@@ -224,6 +225,42 @@ impl AsyncEventbus {
     #[getter]
     fn batch_config(&self) -> BatchConfig {
         self.batch_config.clone()
+    }
+
+    #[pyo3(signature = (exchange_name, options=None, command_timeout=None))]
+    fn declare_exchange<'py>(
+        slf: PyRef<'py, Self>,
+        exchange_name: &str,
+        options: Option<ExchangeOptions>,
+        command_timeout: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let eventbus = Arc::clone(&slf.eventbus);
+        let exchange_name = exchange_name.to_owned();
+        let ru_opts = options.unwrap_or_else(ExchangeOptions::topic).into();
+        let cmd_timeout = command_timeout.map(std::time::Duration::from_secs);
+        pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
+            eventbus
+                .declare_exchange(&exchange_name, ru_opts, cmd_timeout)
+                .await
+                .map_err(|e| PyErr::from(AppError::from(e)))
+        })
+    }
+
+    #[pyo3(signature = (topology, command_timeout=None))]
+    fn declare_topology<'py>(
+        slf: PyRef<'py, Self>,
+        topology: Topology,
+        command_timeout: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let eventbus = Arc::clone(&slf.eventbus);
+        let ru_topology = topology.to_ru_topology()?;
+        let cmd_timeout = command_timeout.map(std::time::Duration::from_secs);
+        pyo3_async_runtimes::tokio::future_into_py(slf.py(), async move {
+            eventbus
+                .declare_topology(ru_topology, cmd_timeout)
+                .await
+                .map_err(|e| PyErr::from(AppError::from(e)))
+        })
     }
 
     #[allow(clippy::too_many_arguments, clippy::collapsible_if)]
@@ -502,7 +539,7 @@ impl AsyncEventbus {
                                             }
                                         },
                                         Err(e) => {
-                                            tasks.push((Err(e.to_string()), item.ack_tx));
+                                            tasks.push((Err(e), item.ack_tx));
                                         }
                                     }
                                 }
@@ -519,14 +556,14 @@ impl AsyncEventbus {
                                             let _ = ack_tx.send(Ok(()));
                                         }
                                         Err(e) => {
-                                            let _ = ack_tx.send(Err(Box::new(std::io::Error::other(e.to_string()))));
+                                            let _ = ack_tx.send(Err(py_err_to_handler_error(e)));
                                         }
                                     },
                                     Ok(None) => {
                                         let _ = ack_tx.send(Ok(()));
                                     }
-                                    Err(err_msg) => {
-                                        let _ = ack_tx.send(Err(Box::new(std::io::Error::other(err_msg))));
+                                    Err(e) => {
+                                        let _ = ack_tx.send(Err(py_err_to_handler_error(e)));
                                     }
                                 }
                             })).await;
@@ -580,9 +617,9 @@ impl AsyncEventbus {
                                 match future_result {
                                     Ok(py_future) => match py_future.await {
                                         Ok(_) => Ok(()),
-                                        Err(e) => Err(Box::new(std::io::Error::other(e.to_string())) as _),
+                                        Err(e) => Err(py_err_to_handler_error(e)),
                                     },
-                                    Err(e) => Err(Box::new(std::io::Error::other(format!("Failed to execute Python callback: {}", e))) as _),
+                                    Err(e) => Err(py_err_to_handler_error(e)),
                                 }
                             }
                         },
@@ -791,24 +828,15 @@ impl AsyncEventbus {
                                             let bound = result.bind(py);
                                             if let Ok(bytes) = bound.cast::<PyBytes>() {
                                                 let body: Arc<[u8]> = bytes.as_bytes().into();
-                                                Ok(RuMessage {
-                                                    body,
-                                                    content_type: None,
-                                                })
+                                                Ok(RuMessage::new(body, None))
                                             } else if let Ok(msg_ref) = bound.cast::<Message>() {
                                                 Ok(RuMessage::from(msg_ref.get()))
                                             } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
                                                 let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
-                                                Ok(RuMessage {
-                                                    body,
-                                                    content_type: None,
-                                                })
+                                                Ok(RuMessage::new(body, None))
                                             } else if let Ok(py_str) = bound.cast::<pyo3::types::PyString>() {
                                                 let body: Arc<[u8]> = py_str.to_str()?.as_bytes().into();
-                                                Ok(RuMessage {
-                                                    body,
-                                                    content_type: Some("text/plain".to_string()),
-                                                })
+                                                Ok(RuMessage::new(body, Some("text/plain".to_string())))
                                             } else {
                                                 Err(Box::new(std::io::Error::new(
                                                     std::io::ErrorKind::InvalidData,
@@ -826,15 +854,9 @@ impl AsyncEventbus {
                                                 as Box<dyn std::error::Error + Send + Sync>),
                                         }
                                     }
-                                    Err(e) => Err(Box::new(std::io::Error::other(
-                                        e.to_string(),
-                                    ))
-                                        as Box<dyn std::error::Error + Send + Sync>),
+                                    Err(e) => Err(py_err_to_handler_error(e)),
                                 },
-                                Err(e) => Err(Box::new(std::io::Error::other(
-                                    format!("Failed to execute Python callback: {}", e),
-                                ))
-                                    as Box<dyn std::error::Error + Send + Sync>),
+                                Err(e) => Err(py_err_to_handler_error(e)),
                             }
                         }
                     },
@@ -884,8 +906,12 @@ fn amqp_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Message>()?;
     m.add_class::<DeliveryMode>()?;
     m.add_class::<QueueOptions>()?;
+    m.add_class::<ExchangeType>()?;
+    m.add_class::<ExchangeOptions>()?;
+    m.add_class::<Topology>()?;
     m.add_class::<PublishConfirmations>()?;
     m.add_class::<BatchConfig>()?;
     m.add_class::<DeliveryAck>()?;
+    m.add("RequeueError", m.py().get_type::<RequeueError>())?;
     Ok(())
 }

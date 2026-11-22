@@ -1,6 +1,6 @@
 {
   "name": "amqp-rs",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Node.js AMQP Client Library developed in Rust using N-API.",
   "main": "index.js",
   "repository": {

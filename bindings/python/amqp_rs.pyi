@@ -1,17 +1,108 @@
-from typing import Callable, Optional, Awaitable, Union, Sequence
+from typing import Callable, Optional, Awaitable, Union, Sequence, Dict
 from concurrent.futures import Future
 from enum import Enum
 
 PayloadType = Union[bytes, str, bytearray, "Message"]
 
 
+class RequeueError(Exception): ...
+
+
 def init_tokio(worker_threads: Optional[int] = None) -> None: ...
+
+
+class ExchangeType(Enum):
+    Direct = 0
+    Fanout = 1
+    Topic = 2
+    Headers = 3
+
+
+class ExchangeOptions:
+    exchange_type: ExchangeType
+    durable: bool
+    auto_delete: bool
+    internal: bool
+    no_create: bool
+
+    def __init__(
+        self,
+        exchange_type: ExchangeType = ExchangeType.Topic,
+        durable: bool = True,
+        auto_delete: bool = False,
+        internal: bool = False,
+        no_create: bool = False,
+    ) -> None: ...
+
+    @staticmethod
+    def topic() -> "ExchangeOptions": ...
+    @staticmethod
+    def direct() -> "ExchangeOptions": ...
+    @staticmethod
+    def fanout() -> "ExchangeOptions": ...
+    @staticmethod
+    def headers() -> "ExchangeOptions": ...
+
+
+class QueueOptions:
+    auto_delete: bool
+    durable: bool
+    exclusive: bool
+    no_create: bool
+    dead_letter_exchange: Optional[str]
+    dead_letter_routing_key: Optional[str]
+    message_ttl: Optional[int]
+    expires: Optional[int]
+    max_length: Optional[int]
+    max_priority: Optional[int]
+    arguments: Dict[str, str]
+
+    def __init__(
+        self,
+        auto_delete: bool = False,
+        durable: bool = True,
+        exclusive: bool = False,
+        no_create: bool = False,
+        arguments: Optional[Dict[str, str]] = None,
+        dead_letter_exchange: Optional[str] = None,
+        dead_letter_routing_key: Optional[str] = None,
+        message_ttl: Optional[int] = None,
+        expires: Optional[int] = None,
+        max_length: Optional[int] = None,
+        max_priority: Optional[int] = None,
+    ) -> None: ...
+
+
+class Topology:
+    def __init__(self) -> None: ...
+    def exchange(self, name: str, options: Optional[ExchangeOptions] = None) -> "Topology": ...
+    def queue(self, name: str, options: Optional[QueueOptions] = None) -> "Topology": ...
+    def bind(self, queue_name: str, exchange_name: str, routing_key: str) -> "Topology": ...
 
 
 class Message:
     @property
     def body(self) -> bytes: ...
-    content_type: Optional[str]
+    @property
+    def content_type(self) -> Optional[str]: ...
+    @property
+    def routing_key(self) -> Optional[str]: ...
+    @property
+    def exchange(self) -> Optional[str]: ...
+    @property
+    def redelivered(self) -> bool: ...
+    @property
+    def delivery_tag(self) -> Optional[int]: ...
+    @property
+    def correlation_id(self) -> Optional[str]: ...
+    @property
+    def message_id(self) -> Optional[str]: ...
+    @property
+    def app_id(self) -> Optional[str]: ...
+    @property
+    def timestamp(self) -> Optional[int]: ...
+    @property
+    def headers(self) -> Optional[Dict[str, str]]: ...
 
     def __init__(self, body: PayloadType, content_type: Optional[str] = None) -> None: ...
 
@@ -54,6 +145,10 @@ class ConfigOptions:
     max_pending_commands: Optional[int]
     max_pending_bytes: Optional[int]
     fail_fast_on_disconnect: Optional[bool]
+    sub_exchange: Optional[ExchangeOptions]
+    sub_queue: Optional[QueueOptions]
+    rpc_exchange: Optional[ExchangeOptions]
+    rpc_queue: Optional[QueueOptions]
     def __init__(
         self,
         queue_name: str,
@@ -65,6 +160,10 @@ class ConfigOptions:
         max_pending_commands: Optional[int] = None,
         max_pending_bytes: Optional[int] = None,
         fail_fast_on_disconnect: Optional[bool] = None,
+        sub_exchange: Optional[ExchangeOptions] = None,
+        sub_queue: Optional[QueueOptions] = None,
+        rpc_exchange: Optional[ExchangeOptions] = None,
+        rpc_queue: Optional[QueueOptions] = None,
     ) -> None: ...
 
 class TlsAdaptor:
@@ -105,7 +204,7 @@ class QoSConfig:
     rpc_server_prefetch: Optional[int]
     rpc_client_prefetch: Optional[int]
 
-    def __init__(self, pub_confirm: bool = True, rpc_client_confirm: bool = True, rpc_server_confirm: bool = False, sub_auto_ack: bool = False, rpc_server_auto_ack: bool = False, rpc_client_auto_ack: bool = False, sub_prefetch: Optional[int] = None, rpc_server_prefetch: Optional[int] = None, rpc_client_prefetch: Optional[int] = None) -> None:
+    def __init__(self, pub_confirm: bool = True, rpc_client_confirm: bool = True, rpc_server_confirm: bool = False, sub_auto_ack: bool = False, rpc_server_auto_ack: bool = False, rpc_client_auto_ack: bool = True, sub_prefetch: Optional[int] = None, rpc_server_prefetch: Optional[int] = None, rpc_client_prefetch: Optional[int] = None) -> None:
         """
         Args:
             pub_confirm: set True to allow publisher confirmations on pub connectio
@@ -166,6 +265,19 @@ class AsyncEventbus:
         """
         ...
 
+    def declare_exchange(
+        self,
+        exchange_name: str,
+        options: Optional[ExchangeOptions] = None,
+        command_timeout: Optional[int] = None,
+    ) -> Future[None]: ...
+
+    def declare_topology(
+        self,
+        topology: Topology,
+        command_timeout: Optional[int] = None,
+    ) -> Future[None]: ...
+
     def publish(
         self, 
         exchange_name: str,
@@ -173,8 +285,7 @@ class AsyncEventbus:
         body: PayloadType,
         content_type: Optional[str] = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
-        publish_timeout: int = 16,
-        connection_timeout: int = 16,
+        command_timeout: Optional[int] = 16,
         delivery_mode: DeliveryMode = DeliveryMode.Transient,
         expiration: Optional[int] = None,
     ) -> Future[None]:
@@ -217,7 +328,7 @@ class AsyncEventbus:
         messages: Sequence[PayloadType],
         content_type: Optional[str] = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
-        publish_timeout: int = 16,
+        command_timeout: Optional[int] = 16,
         delivery_mode: DeliveryMode = DeliveryMode.Transient,
     ) -> Future[None]:
         """
@@ -233,7 +344,7 @@ class AsyncEventbus:
         content_type: str = "application/json",
         content_encoding: ContentEncoding = ContentEncoding.Null,
         response_timeout: int = 20_000,
-        command_timeout: int = 32,
+        connection_timeout: Optional[int] = 32,
         delivery_mode: DeliveryMode = DeliveryMode.Transient,
         expiration: Optional[int] = None,
     ) -> Future[bytes]:
