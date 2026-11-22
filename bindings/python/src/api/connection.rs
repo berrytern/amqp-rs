@@ -1,7 +1,8 @@
 use crate::{
-    exceptions::AppError,
+    exceptions::{AppError, py_err_to_handler_error},
     utils::{
-        Config, ContentEncoding, DeliveryMode, Message, Payload, PublishConfirmations, QueueOptions,
+        Config, ContentEncoding, DeliveryMode, ExchangeOptions, Message, Payload,
+        PublishConfirmations, QueueOptions, Topology,
     },
 };
 use amqp_client_rust::api::{
@@ -41,6 +42,7 @@ impl AsyncConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (exchange_name, routing_key, body, content_type, content_encoding, command_timeout, delivery_mode, expiration=None))]
     pub fn publish<'py>(
         slf: PyRef<'py, Self>,
         exchange_name: &str,
@@ -126,15 +128,9 @@ impl AsyncConnection {
                     match future_result {
                         Ok(py_future) => match py_future.await {
                             Ok(_) => Ok(()),
-                            Err(e) => Err(Box::new(std::io::Error::other(
-                                e.to_string(),
-                            ))
-                                as Box<dyn std::error::Error + Send + Sync>),
+                            Err(e) => Err(py_err_to_handler_error(e)),
                         },
-                        Err(e) => Err(Box::new(std::io::Error::other(
-                            format!("Failed to execute Python callback: {}", e),
-                        ))
-                            as Box<dyn std::error::Error + Send + Sync>),
+                        Err(e) => Err(py_err_to_handler_error(e)),
                     }
                 })
                 .await
@@ -231,24 +227,15 @@ impl AsyncConnection {
                                     let bound = result.bind(py);
                                     if let Ok(bytes) = bound.cast::<PyBytes>() {
                                         let body: Arc<[u8]> = bytes.as_bytes().into();
-                                        Ok(RuMessage {
-                                            body,
-                                            content_type: None,
-                                        })
+                                        Ok(RuMessage::new(body, None))
                                     } else if let Ok(msg_ref) = bound.cast::<Message>() {
                                         Ok(RuMessage::from(msg_ref.get()))
                                     } else if let Ok(byte_array) = bound.cast::<pyo3::types::PyByteArray>() {
                                         let body: Arc<[u8]> = (unsafe { byte_array.as_bytes() }).into();
-                                        Ok(RuMessage {
-                                            body,
-                                            content_type: None,
-                                        })
+                                        Ok(RuMessage::new(body, None))
                                     } else if let Ok(py_str) = bound.cast::<pyo3::types::PyString>() {
                                         let body: Arc<[u8]> = py_str.to_str()?.as_bytes().into();
-                                        Ok(RuMessage {
-                                            body,
-                                            content_type: Some("text/plain".to_string()),
-                                        })
+                                        Ok(RuMessage::new(body, Some("text/plain".to_string())))
                                     } else {
                                         Err(Box::new(std::io::Error::new(
                                             std::io::ErrorKind::InvalidData,
@@ -264,15 +251,9 @@ impl AsyncConnection {
                                         as Box<dyn std::error::Error + Send + Sync>),
                                 }
                             }
-                            Err(e) => Err(Box::new(std::io::Error::other(
-                                e.to_string(),
-                            ))
-                                as Box<dyn std::error::Error + Send + Sync>),
+                            Err(e) => Err(py_err_to_handler_error(e)),
                         },
-                        Err(e) => Err(Box::new(std::io::Error::other(
-                            format!("Failed to execute Python callback: {}", e),
-                        ))
-                            as Box<dyn std::error::Error + Send + Sync>),
+                        Err(e) => Err(py_err_to_handler_error(e)),
                     }
                 })
                 .await
@@ -316,6 +297,7 @@ impl AsyncConnection {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (exchange_name, routing_key, body, content_type, content_encoding, response_timeout_millis, command_timeout, delivery_mode, expiration=None))]
     pub fn rpc_client<'py>(
         slf: PyRef<'py, Self>,
         exchange_name: &str,
@@ -352,6 +334,42 @@ impl AsyncConnection {
             )
             .await
             .map_err(|e| PyValueError::new_err(format!("Failed to execute RPC request: {}", e)))
+        })
+    }
+
+    #[pyo3(signature = (exchange_name, options=None, command_timeout=None))]
+    pub fn declare_exchange<'py>(
+        slf: PyRef<'py, Self>,
+        exchange_name: &str,
+        options: Option<ExchangeOptions>,
+        command_timeout: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let conn = Arc::clone(&slf.inner);
+        let exchange_name = exchange_name.to_owned();
+        let ru_opts = options.unwrap_or_else(ExchangeOptions::topic).into();
+        let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            conn.declare_exchange(&exchange_name, ru_opts, command_timeout)
+                .await
+                .map_err(|e| PyErr::from(AppError::from(e)))
+        })
+    }
+
+    #[pyo3(signature = (topology, command_timeout=None))]
+    pub fn declare_topology<'py>(
+        slf: PyRef<'py, Self>,
+        topology: Topology,
+        command_timeout: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let py = slf.py();
+        let conn = Arc::clone(&slf.inner);
+        let ru_topology = topology.to_ru_topology()?;
+        let command_timeout = command_timeout.map(std::time::Duration::from_secs);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            conn.declare_topology(ru_topology, command_timeout)
+                .await
+                .map_err(|e| PyErr::from(AppError::from(e)))
         })
     }
 

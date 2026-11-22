@@ -3,7 +3,10 @@ use amqp_client_rust::{
     amqprs::tls::TlsAdaptor as RuTlsAdaptor,
     api::utils::{
         Confirmations as RuPublishConfirmation, ContentEncoding as RuContentEncoding,
-        DeliveryMode as RuDeliveryMode, Message as RuMessage, QueueOptions as RuQueueOptions,
+        DeliveryMode as RuDeliveryMode, ExchangeOptions as RuExchangeOptions,
+        ExchangeType as RuExchangeType, Message as RuMessage,
+        MessageMetadata as RuMessageMetadata, QueueOptions as RuQueueOptions,
+        Topology as RuTopology,
     },
     domain::config::{
         Config as RuConfig, ConfigOptions as RuConfigOptions, QoSConfig as RuQoSConfig,
@@ -34,43 +37,226 @@ impl From<DeliveryMode> for RuDeliveryMode {
 }
 
 #[pyclass(from_py_object, get_all, set_all)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExchangeType {
+    Direct = 0,
+    Fanout = 1,
+    Topic = 2,
+    Headers = 3,
+}
+
+impl From<ExchangeType> for RuExchangeType {
+    fn from(val: ExchangeType) -> Self {
+        match val {
+            ExchangeType::Direct => RuExchangeType::Direct,
+            ExchangeType::Fanout => RuExchangeType::Fanout,
+            ExchangeType::Topic => RuExchangeType::Topic,
+            ExchangeType::Headers => RuExchangeType::Headers,
+        }
+    }
+}
+
+#[pyclass(from_py_object, get_all, set_all)]
+#[derive(Debug, Clone, Copy)]
+pub struct ExchangeOptions {
+    pub exchange_type: ExchangeType,
+    pub durable: bool,
+    pub auto_delete: bool,
+    pub internal: bool,
+    pub no_create: bool,
+}
+
+#[pymethods]
+impl ExchangeOptions {
+    #[new]
+    #[pyo3(signature = (exchange_type=ExchangeType::Topic, durable=true, auto_delete=false, internal=false, no_create=false))]
+    fn new(
+        exchange_type: ExchangeType,
+        durable: bool,
+        auto_delete: bool,
+        internal: bool,
+        no_create: bool,
+    ) -> Self {
+        Self {
+            exchange_type,
+            durable,
+            auto_delete,
+            internal,
+            no_create,
+        }
+    }
+
+    #[staticmethod]
+    pub fn topic() -> Self {
+        Self::new(ExchangeType::Topic, true, false, false, false)
+    }
+
+    #[staticmethod]
+    pub fn direct() -> Self {
+        Self::new(ExchangeType::Direct, true, false, false, false)
+    }
+
+    #[staticmethod]
+    pub fn fanout() -> Self {
+        Self::new(ExchangeType::Fanout, true, false, false, false)
+    }
+
+    #[staticmethod]
+    pub fn headers() -> Self {
+        Self::new(ExchangeType::Headers, true, false, false, false)
+    }
+}
+
+impl From<ExchangeOptions> for RuExchangeOptions {
+    fn from(opts: ExchangeOptions) -> Self {
+        RuExchangeOptions {
+            exchange_type: opts.exchange_type.into(),
+            durable: opts.durable,
+            auto_delete: opts.auto_delete,
+            internal: opts.internal,
+            no_create: opts.no_create,
+        }
+    }
+}
+
+#[pyclass(from_py_object, get_all, set_all)]
 #[derive(Debug, Clone)]
 pub struct QueueOptions {
     pub auto_delete: bool,
     pub durable: bool,
     pub exclusive: bool,
     pub no_create: bool,
+    pub dead_letter_exchange: Option<String>,
+    pub dead_letter_routing_key: Option<String>,
+    pub message_ttl: Option<u32>,
+    pub expires: Option<u32>,
+    pub max_length: Option<u32>,
+    pub max_priority: Option<u8>,
     pub arguments: HashMap<String, String>,
 }
 #[pymethods]
 impl QueueOptions {
     #[new]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (auto_delete=false, durable=true, exclusive=false, no_create=false, arguments=None, dead_letter_exchange=None, dead_letter_routing_key=None, message_ttl=None, expires=None, max_length=None, max_priority=None))]
     fn new(
         auto_delete: bool,
         durable: bool,
         exclusive: bool,
         no_create: bool,
-        arguments: HashMap<String, String>,
+        arguments: Option<HashMap<String, String>>,
+        dead_letter_exchange: Option<String>,
+        dead_letter_routing_key: Option<String>,
+        message_ttl: Option<u32>,
+        expires: Option<u32>,
+        max_length: Option<u32>,
+        max_priority: Option<u8>,
     ) -> Self {
         Self {
             auto_delete,
             durable,
             exclusive,
             no_create,
-            arguments,
+            dead_letter_exchange,
+            dead_letter_routing_key,
+            message_ttl,
+            expires,
+            max_length,
+            max_priority,
+            arguments: arguments.unwrap_or_default(),
         }
     }
 }
 
 impl QueueOptions {
     pub fn to_ru_options(options: QueueOptions) -> Result<RuQueueOptions, AppError> {
-        let queue_options = RuQueueOptions::new()
+        let mut queue_options = RuQueueOptions::new()
             .auto_delete(options.auto_delete)
             .durable(options.durable)
             .exclusive(options.exclusive)
             .no_create(options.no_create)
             .arguments(&options.arguments)?;
+        if let Some(dlx) = options.dead_letter_exchange {
+            queue_options = queue_options.dead_letter_exchange(dlx);
+        }
+        if let Some(dlk) = options.dead_letter_routing_key {
+            queue_options = queue_options.dead_letter_routing_key(dlk);
+        }
+        if let Some(ttl) = options.message_ttl {
+            queue_options = queue_options.message_ttl(ttl);
+        }
+        if let Some(exp) = options.expires {
+            queue_options = queue_options.expires(exp);
+        }
+        if let Some(max_len) = options.max_length {
+            queue_options = queue_options.max_length(max_len);
+        }
+        if let Some(max_prio) = options.max_priority {
+            queue_options = queue_options.max_priority(max_prio);
+        }
         Ok(queue_options)
+    }
+}
+
+#[pyclass(from_py_object)]
+#[derive(Debug, Clone, Default)]
+pub struct Topology {
+    pub exchanges: Vec<(String, ExchangeOptions)>,
+    pub queues: Vec<(String, QueueOptions)>,
+    pub bindings: Vec<(String, String, String)>,
+}
+
+#[pymethods]
+impl Topology {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[pyo3(signature = (name, options=None))]
+    fn exchange(mut slf: PyRefMut<'_, Self>, name: String, options: Option<ExchangeOptions>) -> Self {
+        slf.exchanges.push((name, options.unwrap_or_else(ExchangeOptions::topic)));
+        slf.clone()
+    }
+
+    #[pyo3(signature = (name, options=None))]
+    fn queue(mut slf: PyRefMut<'_, Self>, name: String, options: Option<QueueOptions>) -> Self {
+        let q_opts = options.unwrap_or_else(|| QueueOptions {
+            auto_delete: false,
+            durable: true,
+            exclusive: false,
+            no_create: false,
+            dead_letter_exchange: None,
+            dead_letter_routing_key: None,
+            message_ttl: None,
+            expires: None,
+            max_length: None,
+            max_priority: None,
+            arguments: HashMap::new(),
+        });
+        slf.queues.push((name, q_opts));
+        slf.clone()
+    }
+
+    fn bind(mut slf: PyRefMut<'_, Self>, queue_name: String, exchange_name: String, routing_key: String) -> Self {
+        slf.bindings.push((queue_name, exchange_name, routing_key));
+        slf.clone()
+    }
+}
+
+impl Topology {
+    pub fn to_ru_topology(self) -> Result<RuTopology, AppError> {
+        let mut topo = RuTopology::new();
+        for (name, opts) in self.exchanges {
+            topo = topo.exchange(name, opts.into());
+        }
+        for (name, opts) in self.queues {
+            topo = topo.queue(name, QueueOptions::to_ru_options(opts)?);
+        }
+        for (queue_name, exchange_name, routing_key) in self.bindings {
+            topo = topo.bind(queue_name, exchange_name, routing_key);
+        }
+        Ok(topo)
     }
 }
 
@@ -104,6 +290,7 @@ impl From<PublishConfirmations> for RuPublishConfirmation {
 pub struct Message {
     pub body: Arc<[u8]>,
     pub content_type: Option<String>,
+    pub metadata: Option<Arc<RuMessageMetadata>>,
     pub cached_body: std::sync::OnceLock<Py<PyBytes>>,
 }
 
@@ -112,6 +299,7 @@ impl Clone for Message {
         Self {
             body: self.body.clone(),
             content_type: self.content_type.clone(),
+            metadata: self.metadata.clone(),
             cached_body: std::sync::OnceLock::new(),
         }
     }
@@ -122,6 +310,7 @@ impl From<RuMessage> for Message {
         Self {
             body: msg.body,
             content_type: msg.content_type,
+            metadata: msg.metadata,
             cached_body: std::sync::OnceLock::new(),
         }
     }
@@ -131,6 +320,7 @@ impl From<Message> for RuMessage {
         Self {
             body: msg.body,
             content_type: msg.content_type,
+            metadata: msg.metadata,
         }
     }
 }
@@ -139,6 +329,7 @@ impl From<&Message> for RuMessage {
         Self {
             body: msg.body.clone(),
             content_type: msg.content_type.clone(),
+            metadata: msg.metadata.clone(),
         }
     }
 }
@@ -161,6 +352,7 @@ impl Message {
         Ok(Self {
             body: body_bytes,
             content_type: content_type.or(detected_ct),
+            metadata: None,
             cached_body: std::sync::OnceLock::new(),
         })
     }
@@ -193,6 +385,51 @@ impl Message {
     #[getter]
     fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
+    }
+
+    #[getter]
+    fn routing_key(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.routing_key())
+    }
+
+    #[getter]
+    fn exchange(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.exchange())
+    }
+
+    #[getter]
+    fn redelivered(&self) -> bool {
+        self.metadata.as_deref().is_some_and(|m| m.redelivered())
+    }
+
+    #[getter]
+    fn delivery_tag(&self) -> Option<u64> {
+        self.metadata.as_deref().and_then(|m| m.delivery_tag())
+    }
+
+    #[getter]
+    fn correlation_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.correlation_id())
+    }
+
+    #[getter]
+    fn message_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.message_id())
+    }
+
+    #[getter]
+    fn app_id(&self) -> Option<&str> {
+        self.metadata.as_deref().and_then(|m| m.app_id())
+    }
+
+    #[getter]
+    fn timestamp(&self) -> Option<u64> {
+        self.metadata.as_deref().and_then(|m| m.timestamp())
+    }
+
+    #[getter]
+    fn headers(&self) -> Option<HashMap<String, String>> {
+        self.metadata.as_deref().and_then(|m| m.headers())
     }
 
     unsafe fn __getbuffer__(
@@ -329,12 +566,16 @@ pub struct ConfigOptions {
     pub max_pending_commands: Option<usize>,
     pub max_pending_bytes: Option<usize>,
     pub fail_fast_on_disconnect: Option<bool>,
+    pub sub_exchange: Option<ExchangeOptions>,
+    pub sub_queue: Option<QueueOptions>,
+    pub rpc_exchange: Option<ExchangeOptions>,
+    pub rpc_queue: Option<QueueOptions>,
 }
 #[pymethods]
 impl ConfigOptions {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None, max_pending_commands=None, max_pending_bytes=None, fail_fast_on_disconnect=None))]
+    #[pyo3(signature = (queue_name, rpc_exchange_name, rpc_queue_name, dead_letter_exchange=None, dead_letter_routing_key=None, batch_config=None, max_pending_commands=None, max_pending_bytes=None, fail_fast_on_disconnect=None, sub_exchange=None, sub_queue=None, rpc_exchange=None, rpc_queue=None))]
     fn new(
         queue_name: String,
         rpc_exchange_name: String,
@@ -345,6 +586,10 @@ impl ConfigOptions {
         max_pending_commands: Option<usize>,
         max_pending_bytes: Option<usize>,
         fail_fast_on_disconnect: Option<bool>,
+        sub_exchange: Option<ExchangeOptions>,
+        sub_queue: Option<QueueOptions>,
+        rpc_exchange: Option<ExchangeOptions>,
+        rpc_queue: Option<QueueOptions>,
     ) -> Self {
         Self {
             queue_name,
@@ -356,11 +601,23 @@ impl ConfigOptions {
             max_pending_commands,
             max_pending_bytes,
             fail_fast_on_disconnect,
+            sub_exchange,
+            sub_queue,
+            rpc_exchange,
+            rpc_queue,
         }
     }
 }
 impl From<ConfigOptions> for RuConfigOptions {
     fn from(options: ConfigOptions) -> Self {
+        let sub_queue = options
+            .sub_queue
+            .and_then(|q| QueueOptions::to_ru_options(q).ok())
+            .unwrap_or_else(|| RuQueueOptions::new().durable(true));
+        let rpc_queue = options
+            .rpc_queue
+            .and_then(|q| QueueOptions::to_ru_options(q).ok())
+            .unwrap_or_else(|| RuQueueOptions::new().durable(true));
         Self {
             queue_name: options.queue_name,
             rpc_exchange_name: options.rpc_exchange_name,
@@ -372,6 +629,10 @@ impl From<ConfigOptions> for RuConfigOptions {
             fail_fast_on_disconnect: options.fail_fast_on_disconnect.unwrap_or(false),
             default_command_timeout: std::time::Duration::from_secs(16),
             max_reconnect_delay: 30,
+            sub_exchange: options.sub_exchange.map(Into::into).unwrap_or_else(RuExchangeOptions::topic),
+            sub_queue,
+            rpc_exchange: options.rpc_exchange.map(Into::into).unwrap_or_else(RuExchangeOptions::topic),
+            rpc_queue,
         }
     }
 }
@@ -488,7 +749,7 @@ impl Default for QoSConfig {
             rpc_server_confirm: false,
             sub_auto_ack: false,
             rpc_server_auto_ack: false,
-            rpc_client_auto_ack: false,
+            rpc_client_auto_ack: true,
             sub_prefetch: None,
             rpc_server_prefetch: None,
             rpc_client_prefetch: None,
@@ -500,7 +761,7 @@ impl Default for QoSConfig {
 impl QoSConfig {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (pub_confirm=true, rpc_client_confirm=true, rpc_server_confirm=false, sub_auto_ack=false, rpc_server_auto_ack=false, rpc_client_auto_ack=false, sub_prefetch=None, rpc_server_prefetch=None, rpc_client_prefetch=None))]
+    #[pyo3(signature = (pub_confirm=true, rpc_client_confirm=true, rpc_server_confirm=false, sub_auto_ack=false, rpc_server_auto_ack=false, rpc_client_auto_ack=true, sub_prefetch=None, rpc_server_prefetch=None, rpc_client_prefetch=None))]
     fn new(
         pub_confirm: bool,
         rpc_client_confirm: bool,

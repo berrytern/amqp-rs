@@ -1,7 +1,21 @@
-use amqp_client_rust::errors::{AppError as RuAppError, AppErrorType};
-use pyo3::PyErr;
+use amqp_client_rust::errors::{AppError as RuAppError, AppErrorType, RequeueError as RuRequeueError};
 use pyo3::exceptions::PyException;
+use pyo3::{PyErr, Python};
 use std::fmt::{self, Display};
+
+pyo3::create_exception!(amqp_rs, RequeueError, PyException);
+
+/// Converts a Python exception raised inside a subscriber/RPC handler into a Rust
+/// boxed error, preserving `RequeueError` so `amqp-client-rust` sends `Basic.Nack(requeue=true)`.
+pub fn py_err_to_handler_error(err: PyErr) -> Box<dyn std::error::Error + Send + Sync> {
+    let is_requeue = Python::try_attach(|py| err.is_instance_of::<RequeueError>(py)).unwrap_or(false);
+    let msg = err.to_string();
+    if is_requeue {
+        Box::new(RuRequeueError::new(msg))
+    } else {
+        Box::new(std::io::Error::other(msg))
+    }
+}
 
 impl From<RuAppError> for AppError {
     fn from(error: RuAppError) -> Self {

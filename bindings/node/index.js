@@ -705,3 +705,4 @@ module.exports.Config = nativeBinding.Config
 module.exports.TlsAdaptor = nativeBinding.TlsAdaptor
 module.exports.ContentEncoding = nativeBinding.ContentEncoding
 module.exports.DeliveryMode = nativeBinding.DeliveryMode
+module.exports.ExchangeType = nativeBinding.ExchangeType
