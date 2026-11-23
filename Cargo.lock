@@ -53,6 +53,8 @@ version = "0.2.0"
 dependencies = [
  "amqp-client-rust",
  "amqp-rs-core",
+ "futures",
+ "mimalloc",
  "napi",
  "napi-build",
  "napi-derive",

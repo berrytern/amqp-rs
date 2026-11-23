@@ -135,6 +135,31 @@ console.log('RPC Response:', response.toString('utf8'))
 
 ---
 
+### 4. High-Throughput Batching (`publishBatch` & `subscribeBatch`)
+
+```ts
+await bus.subscribeBatch(
+  'orders_exchange',
+  'orders.created',
+  async (messages) => {
+    for (const msg of messages) {
+      // lazy getters: only accesses body without allocating metadata strings
+      console.log(msg.body.toString('utf8'))
+    }
+  },
+  100, // batchSize
+  5,   // maxDelayMs
+)
+
+await bus.publishBatch(
+  'orders_exchange',
+  'orders.created',
+  [Buffer.from('{"id":1}'), Buffer.from('{"id":2}')],
+)
+```
+
+---
+
 ## Development
 
 ```bash

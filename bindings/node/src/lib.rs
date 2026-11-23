@@ -18,12 +18,32 @@ use amqp_client_rust::{
 use amqp_rs_core::*;
 use napi::{
   bindgen_prelude::*,
-  threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode, UnknownReturnValue},
+  threadsafe_function::ThreadsafeFunction,
 };
 use napi_derive::napi;
 
 pub mod exceptions;
 use exceptions::AppError;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+fn napi_err_to_handler_error(err: napi::Error) -> Box<dyn std::error::Error + Send + Sync> {
+  let msg = err.reason;
+  if msg.starts_with("RequeueError") {
+    Box::new(amqp_client_rust::errors::RequeueError::new(msg))
+  } else {
+    Box::new(std::io::Error::other(msg))
+  }
+}
+
+struct SubItem {
+  message: RuMessage,
+  ack_tx: tokio::sync::oneshot::Sender<
+    std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>,
+  >,
+}
 
 #[napi]
 #[derive(Debug, Clone)]
@@ -211,47 +231,116 @@ impl TryFrom<Topology> for RuTopology {
   }
 }
 
-#[napi(object)]
+#[napi]
 pub struct Message {
-  pub body: Buffer,
-  pub content_type: Option<String>,
-  pub routing_key: Option<String>,
-  pub exchange: Option<String>,
-  pub redelivered: Option<bool>,
-  pub delivery_tag: Option<i64>,
-  pub correlation_id: Option<String>,
-  pub message_id: Option<String>,
-  pub app_id: Option<String>,
-  pub timestamp: Option<i64>,
-  pub headers: Option<HashMap<String, String>>,
+  pub(crate) inner: RuMessage,
 }
 
-impl From<RuMessage> for Message {
-  fn from(msg: RuMessage) -> Self {
-    let meta = msg.metadata.as_deref();
+#[napi]
+impl Message {
+  #[napi(constructor)]
+  pub fn new(body: Either<Buffer, String>, content_type: Option<String>) -> Self {
+    let payload: Arc<[u8]> = match body {
+      Either::A(b) => Arc::from(b.as_ref()),
+      Either::B(s) => Arc::from(s.into_bytes()),
+    };
     Self {
-      body: Buffer::from(msg.body.as_ref()),
-      content_type: msg.content_type,
-      routing_key: meta.and_then(|m| m.routing_key().map(str::to_owned)),
-      exchange: meta.and_then(|m| m.exchange().map(str::to_owned)),
-      redelivered: meta.map(|m| m.redelivered()),
-      delivery_tag: meta.and_then(|m| m.delivery_tag().map(|t| t as i64)),
-      correlation_id: meta.and_then(|m| m.correlation_id().map(str::to_owned)),
-      message_id: meta.and_then(|m| m.message_id().map(str::to_owned)),
-      app_id: meta.and_then(|m| m.app_id().map(str::to_owned)),
-      timestamp: meta.and_then(|m| m.timestamp().map(|t| t as i64)),
-      headers: meta.and_then(|m| m.headers()),
+      inner: RuMessage::new(payload, content_type),
     }
+  }
+
+  #[napi(getter)]
+  pub fn body(&self) -> Buffer {
+    Buffer::from(self.inner.body.as_ref())
+  }
+
+  #[napi(getter)]
+  pub fn content_type(&self) -> Option<&str> {
+    self.inner.content_type.as_deref()
+  }
+
+  #[napi(getter)]
+  pub fn routing_key(&self) -> Option<&str> {
+    self.inner.metadata.as_deref().and_then(|m| m.routing_key())
+  }
+
+  #[napi(getter)]
+  pub fn exchange(&self) -> Option<&str> {
+    self.inner.metadata.as_deref().and_then(|m| m.exchange())
+  }
+
+  #[napi(getter)]
+  pub fn redelivered(&self) -> bool {
+    self
+      .inner
+      .metadata
+      .as_deref()
+      .is_some_and(|m| m.redelivered())
+  }
+
+  #[napi(getter)]
+  pub fn delivery_tag(&self) -> Option<i64> {
+    self
+      .inner
+      .metadata
+      .as_deref()
+      .and_then(|m| m.delivery_tag().map(|t| t as i64))
+  }
+
+  #[napi(getter)]
+  pub fn correlation_id(&self) -> Option<&str> {
+    self
+      .inner
+      .metadata
+      .as_deref()
+      .and_then(|m| m.correlation_id())
+  }
+
+  #[napi(getter)]
+  pub fn message_id(&self) -> Option<&str> {
+    self.inner.metadata.as_deref().and_then(|m| m.message_id())
+  }
+
+  #[napi(getter)]
+  pub fn app_id(&self) -> Option<&str> {
+    self.inner.metadata.as_deref().and_then(|m| m.app_id())
+  }
+
+  #[napi(getter)]
+  pub fn timestamp(&self) -> Option<i64> {
+    self
+      .inner
+      .metadata
+      .as_deref()
+      .and_then(|m| m.timestamp().map(|t| t as i64))
+  }
+
+  #[napi(getter)]
+  pub fn headers(&self) -> Option<HashMap<String, String>> {
+    self.inner.metadata.as_deref().and_then(|m| m.headers())
   }
 }
 
-impl From<Message> for RuMessage {
-  fn from(msg: Message) -> Self {
-    Self {
-      body: msg.body.to_vec().into(),
-      content_type: msg.content_type,
-      metadata: None,
-    }
+impl From<RuMessage> for Message {
+  #[inline]
+  fn from(inner: RuMessage) -> Self {
+    Self { inner }
+  }
+}
+
+#[napi(object)]
+pub struct MessagePayload {
+  pub body: Buffer,
+  pub content_type: Option<String>,
+}
+
+type RpcReturnValue = Either3<Buffer, String, MessagePayload>;
+
+fn rpc_return_to_ru_message(val: RpcReturnValue) -> RuMessage {
+  match val {
+    Either3::A(b) => RuMessage::new(Arc::<[u8]>::from(b.as_ref()), None),
+    Either3::B(s) => RuMessage::new(Arc::<[u8]>::from(s.into_bytes()), Some("text/plain".to_string())),
+    Either3::C(m) => RuMessage::new(Arc::<[u8]>::from(m.body.as_ref()), m.content_type),
   }
 }
 
@@ -533,6 +622,53 @@ impl AsyncEventbus {
 
   #[napi]
   #[allow(clippy::too_many_arguments)]
+  pub async fn publish_batch(
+    &self,
+    exchange_name: String,
+    routing_key: String,
+    messages: Vec<Either<Buffer, String>>,
+    content_type: Option<String>,
+    content_encoding: Option<ContentEncoding>,
+    command_timeout: Option<u32>,
+    delivery_mode: Option<DeliveryMode>,
+    expiration: Option<u32>,
+  ) -> Result<()> {
+    let payloads: Vec<Vec<u8>> = messages
+      .into_iter()
+      .map(|body| match body {
+        Either::A(b) => b.to_vec(),
+        Either::B(s) => s.into_bytes(),
+      })
+      .collect();
+
+    let ct = content_type.as_deref().unwrap_or("application/json");
+    let enc = content_encoding.unwrap_or(ContentEncoding::Null);
+    let dm = delivery_mode.unwrap_or(DeliveryMode::Transient);
+    let cmd_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+
+    let futs = payloads.into_iter().map(|payload| {
+      let bus = &self.eventbus;
+      let ex = &exchange_name;
+      let rk = &routing_key;
+      let pub_opts = RuPublishOptions {
+        content_type: ct,
+        content_encoding: enc.clone().into(),
+        command_timeout: cmd_timeout,
+        delivery_mode: dm.clone().into(),
+        expiration,
+      };
+      async move { bus.publish(ex, rk, payload, &pub_opts).await }
+    });
+
+    futures::future::try_join_all(futs)
+      .await
+      .map_err(AppError::from)?;
+
+    Ok(())
+  }
+
+  #[napi]
+  #[allow(clippy::too_many_arguments)]
   pub async fn rpc_client(
     &self,
     exchange_name: String,
@@ -580,8 +716,8 @@ impl AsyncEventbus {
     &self,
     exchange_name: String,
     routing_key: String,
-    #[napi(ts_arg_type = "(msg: Message) => Promise<void>")] handler: Arc<
-      ThreadsafeFunction<Message, UnknownReturnValue>,
+    #[napi(ts_arg_type = "(msg: Message) => Promise<void> | void")] handler: Arc<
+      ThreadsafeFunction<Message, Either<Promise<()>, ()>, Message, Status, false>,
     >,
     process_timeout: Option<u32>,
     command_timeout: Option<u32>,
@@ -597,16 +733,121 @@ impl AsyncEventbus {
         move |body| {
           let handler = handler.clone();
           async move {
-            let status = handler.call(
-              Ok(Message::from(body)),
-              ThreadsafeFunctionCallMode::NonBlocking,
-            );
-            if status == napi::Status::Ok {
-              Ok(())
-            } else {
-              Err(Box::new(std::io::Error::other(
-                format!("ThreadsafeFunction call failed with status: {:?}", status),
-              )) as Box<dyn std::error::Error + Send + Sync>)
+            match handler.call_async_catch(Message::from(body)).await {
+              Ok(Either::A(promise)) => promise.await.map_err(napi_err_to_handler_error),
+              Ok(Either::B(())) => Ok(()),
+              Err(e) => Err(napi_err_to_handler_error(e)),
+            }
+          }
+        },
+        process_timeout,
+        command_timeout,
+      )
+      .await
+      .map_err(AppError::from)?;
+
+    Ok(())
+  }
+
+  #[napi]
+  #[allow(clippy::too_many_arguments)]
+  pub async fn subscribe_batch(
+    &self,
+    exchange_name: String,
+    routing_key: String,
+    #[napi(ts_arg_type = "(messages: Message[]) => Promise<void> | void")] handler: Arc<
+      ThreadsafeFunction<Vec<Message>, Either<Promise<()>, ()>, Vec<Message>, Status, false>,
+    >,
+    batch_size: Option<u32>,
+    max_delay_ms: Option<u32>,
+    process_timeout: Option<u32>,
+    command_timeout: Option<u32>,
+  ) -> Result<()> {
+    let batch_size = batch_size.unwrap_or(100).max(1) as usize;
+    let max_delay = std::time::Duration::from_millis(max_delay_ms.unwrap_or(0) as u64);
+    let process_timeout = process_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+    let command_timeout = command_timeout.map(|t| std::time::Duration::from_secs(t as u64));
+
+    let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<SubItem>(1024);
+
+    tokio::spawn(async move {
+      let mut batch = Vec::with_capacity(batch_size);
+
+      while let Some(first) = sub_rx.recv().await {
+        batch.push(first);
+
+        if max_delay.as_nanos() > 0 {
+          let deadline = tokio::time::Instant::now() + max_delay;
+          while batch.len() < batch_size {
+            tokio::select! {
+              biased;
+              item = sub_rx.recv() => match item {
+                Some(item) => batch.push(item),
+                None => break,
+              },
+              _ = tokio::time::sleep_until(deadline) => break,
+            }
+          }
+        } else {
+          while batch.len() < batch_size {
+            match sub_rx.try_recv() {
+              Ok(item) => batch.push(item),
+              Err(_) => break,
+            }
+          }
+        }
+
+        let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
+        let (messages, ack_txs): (Vec<Message>, Vec<_>) = current_batch
+          .into_iter()
+          .map(|item| (Message::from(item.message), item.ack_tx))
+          .unzip();
+
+        let h = handler.clone();
+        tokio::spawn(async move {
+          let res = match h.call_async_catch(messages).await {
+            Ok(Either::A(promise)) => promise.await,
+            Ok(Either::B(())) => Ok(()),
+            Err(e) => Err(e),
+          };
+          match res {
+            Ok(()) => {
+              for tx in ack_txs {
+                let _ = tx.send(Ok(()));
+              }
+            }
+            Err(e) => {
+              let reason = e.reason;
+              let is_requeue = reason.starts_with("RequeueError");
+              for tx in ack_txs {
+                let err: Box<dyn std::error::Error + Send + Sync> = if is_requeue {
+                  Box::new(amqp_client_rust::errors::RequeueError::new(reason.clone()))
+                } else {
+                  Box::new(std::io::Error::other(reason.clone()))
+                };
+                let _ = tx.send(Err(err));
+              }
+            }
+          }
+        });
+      }
+    });
+
+    self
+      .eventbus
+      .subscribe(
+        &exchange_name,
+        &routing_key,
+        move |body| {
+          let tx = sub_tx.clone();
+          async move {
+            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+            if tx.send(SubItem { message: body, ack_tx }).await.is_err() {
+              return Err(Box::new(std::io::Error::other("Subscription channel closed")) as _);
+            }
+            match ack_rx.await {
+              Ok(res) => res,
+              Err(_) => Err(Box::new(std::io::Error::other("Ack channel dropped")) as _),
             }
           }
         },
@@ -623,8 +864,15 @@ impl AsyncEventbus {
   pub async fn provide_resource(
     &self,
     routing_key: String,
-    #[napi(ts_arg_type = "(msg: Message) => Promise<Buffer | Message>")] handler: Arc<
-      ThreadsafeFunction<Message, Message>,
+    #[napi(ts_arg_type = "(msg: Message) => Promise<Buffer | string | MessagePayload> | Buffer | string | MessagePayload")]
+    handler: Arc<
+      ThreadsafeFunction<
+        Message,
+        Either<Promise<RpcReturnValue>, RpcReturnValue>,
+        Message,
+        Status,
+        false,
+      >,
     >,
     process_timeout: Option<u32>,
     command_timeout: Option<u32>,
@@ -639,12 +887,14 @@ impl AsyncEventbus {
         move |body| {
           let handler = handler.clone();
           async move {
-            // In JS, handlers should return a Buffer (or a JS object mirroring Message)
-            let res: Result<Message, napi::Status> =
-              handler.call_async(Ok(Message::from(body))).await;
-            let buf = res?;
-
-            Ok(buf.into())
+            match handler.call_async_catch(Message::from(body)).await {
+              Ok(Either::A(promise)) => promise
+                .await
+                .map(rpc_return_to_ru_message)
+                .map_err(napi_err_to_handler_error),
+              Ok(Either::B(val)) => Ok(rpc_return_to_ru_message(val)),
+              Err(e) => Err(napi_err_to_handler_error(e)),
+            }
           }
         },
         process_timeout,

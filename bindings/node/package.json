@@ -5,18 +5,19 @@
   "main": "index.js",
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/napi-rs/package-template.git"
+    "url": "https://github.com/berrytern/amqp-rs.git"
   },
   "type": "module",
-  "license": "APACHE 2.0",
+  "license": "Apache-2.0",
   "browser": "browser.js",
   "keywords": [
+    "amqp",
+    "rabbitmq",
+    "async",
+    "fast",
+    "rust",
     "napi-rs",
-    "NAPI",
-    "N-API",
-    "Rust",
-    "node-addon",
-    "node-addon-api"
+    "amqp-rs"
   ],
   "files": [
     "index.d.ts",
