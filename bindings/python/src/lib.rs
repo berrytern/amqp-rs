@@ -17,8 +17,8 @@ use crate::{
     api::connection::AsyncConnection,
     utils::{
         BatchConfig, Config, ConfigOptions, ContentEncoding, DeliveryAck, DeliveryMode,
-        ExchangeOptions, ExchangeType, Message, Payload, PublishConfirmations, QoSConfig,
-        QueueOptions, TlsAdaptor, Topology,
+        ExchangeOptions, ExchangeType, HandlerArgKind, Message, Payload, PublishConfirmations,
+        QoSConfig, QueueOptions, TlsAdaptor, Topology,
     },
 };
 
@@ -472,6 +472,7 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
+        let arg_kind = HandlerArgKind::detect(py, handler.bind(py));
         let handler = Arc::new(handler);
         let exchange_name = exchange_name.to_owned();
         let routing_key = routing_key.to_owned();
@@ -527,8 +528,8 @@ impl AsyncEventbus {
                             let attach_opt = Python::try_attach(|py| {
                                 let bound_handler = item_handler.bind(py);
                                 for item in current_batch {
-                                    let msg = Message::from(item.message);
-                                    match bound_handler.call1((msg,)) {
+                                    let arg_res = arg_kind.into_py_arg(py, item.message);
+                                    match arg_res.and_then(|arg| bound_handler.call1((arg,))) {
                                         Ok(res) => match pyo3_async_runtimes::tokio::into_future(res.clone()) {
                                             Ok(fut) => tasks.push((Ok(Some(fut)), item.ack_tx)),
                                             Err(_) => {
@@ -608,7 +609,8 @@ impl AsyncEventbus {
                             async move {
                                 let future_result = match Python::try_attach(|py| -> PyResult<_> {
                                     let bound_handler = handler_clone.bind(py);
-                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                    let arg = arg_kind.into_py_arg(py, body)?;
+                                    let coro = bound_handler.call1((arg,))?;
                                     pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
                                 }) {
                                     Some(res) => res,
@@ -650,6 +652,7 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
+        let arg_kind = HandlerArgKind::detect_batch(py, handler.bind(py));
         let handler = Arc::new(handler);
         let exchange_name = exchange_name.to_owned();
         let routing_key = routing_key.to_owned();
@@ -695,14 +698,18 @@ impl AsyncEventbus {
                     let current_batch = std::mem::replace(&mut batch, Vec::with_capacity(batch_size));
                     let item_handler = handler_clone.clone();
                     let item_locals = locals_clone.clone();
-                    let (messages, ack_txs): (Vec<Message>, Vec<_>) = current_batch
+                    let (messages, ack_txs): (Vec<RuMessage>, Vec<_>) = current_batch
                         .into_iter()
-                        .map(|item| (Message::from(item.message), item.ack_tx))
+                        .map(|item| (item.message, item.ack_tx))
                         .unzip();
 
                     tokio::spawn(pyo3_async_runtimes::tokio::scope(item_locals, async move {
                         let py_future_res = Python::try_attach(|py| -> PyResult<_> {
-                            let py_messages = pyo3::types::PyList::new(py, messages)?;
+                            let mut py_items = Vec::with_capacity(messages.len());
+                            for msg in messages {
+                                py_items.push(arg_kind.into_py_arg(py, msg)?);
+                            }
+                            let py_messages = pyo3::types::PyList::new(py, py_items)?;
                             let bound_handler = item_handler.bind(py);
                             let res = bound_handler.call1((py_messages,))?;
                             match pyo3_async_runtimes::tokio::into_future(res.clone()) {
@@ -793,6 +800,7 @@ impl AsyncEventbus {
         let eventbus = Arc::clone(&slf.eventbus);
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
+        let arg_kind = HandlerArgKind::detect(py, handler.bind(py));
         let handler = Arc::new(handler);
         let routing_key = routing_key.to_owned();
 
@@ -810,7 +818,8 @@ impl AsyncEventbus {
                             let py_future_result =
                                 match Python::try_attach(|py| -> PyResult<_> {
                                     let bound_handler = handler_clone.bind(py);
-                                    let coro = bound_handler.call1((Message::from(body),))?;
+                                    let arg = arg_kind.into_py_arg(py, body)?;
+                                    let coro = bound_handler.call1((arg,))?;
                                     pyo3_async_runtimes::into_future_with_locals(&locals_clone, coro)
                                 }) {
                                     Some(res) => res,

@@ -15,7 +15,7 @@ output_dir="dist_py"
 rm -rf "$output_dir"
 
 # 3. Define versions and all targets in a single array
-py_versions=("3.8" "3.9" "3.10" "3.11" "3.12" "3.13" "3.13t" "3.14" "3.14t")
+py_versions=("3.9" "3.10" "3.11" "3.12" "3.13" "3.13t" "3.14" "3.14t" "3.15" "3.15t")
 
 targets=(
     "x86_64-apple-darwin"
