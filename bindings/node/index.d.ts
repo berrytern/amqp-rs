@@ -5,14 +5,31 @@ export declare class AsyncEventbus {
   declareExchange(exchangeName: string, options?: ExchangeOptions | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
   declareTopology(topology: Topology, commandTimeout?: number | undefined | null): Promise<void>
   publish(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string | undefined | null, contentEncoding: ContentEncoding, commandTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<void>
+  publishBatch(exchangeName: string, routingKey: string, messages: Array<Buffer | string>, contentType?: string | undefined | null, contentEncoding?: ContentEncoding | undefined | null, commandTimeout?: number | undefined | null, deliveryMode?: DeliveryMode | undefined | null, expiration?: number | undefined | null): Promise<void>
   rpcClient(exchangeName: string, routingKey: string, body: Buffer | string, contentType: string, contentEncoding: ContentEncoding, responseTimeout: number, connectionTimeout: number | undefined | null, deliveryMode: DeliveryMode, expiration?: number | undefined | null): Promise<Buffer>
-  subscribe(exchangeName: string, routingKey: string, handler: (msg: Message) => Promise<void>, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
-  provideResource(routingKey: string, handler: (msg: Message) => Promise<Buffer | Message>, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
+  subscribe(exchangeName: string, routingKey: string, handler: (msg: Message) => Promise<void> | void, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
+  subscribeBatch(exchangeName: string, routingKey: string, handler: (messages: Message[]) => Promise<void> | void, batchSize?: number | undefined | null, maxDelayMs?: number | undefined | null, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
+  provideResource(routingKey: string, handler: (msg: Message) => Promise<Buffer | string | MessagePayload> | Buffer | string | MessagePayload, processTimeout?: number | undefined | null, commandTimeout?: number | undefined | null): Promise<void>
   dispose(): Promise<void>
 }
 
 export declare class Config {
   constructor(host: string, port: number, username: string, password: string, virtualHost: string, options: ConfigOptions, tlsAdaptor?: TlsAdaptor | undefined | null)
+}
+
+export declare class Message {
+  constructor(body: Buffer | string, contentType?: string | undefined | null)
+  get body(): Buffer
+  get contentType(): string | null
+  get routingKey(): string | null
+  get exchange(): string | null
+  get redelivered(): boolean
+  get deliveryTag(): number | null
+  get correlationId(): string | null
+  get messageId(): string | null
+  get appId(): string | null
+  get timestamp(): number | null
+  get headers(): Record<string, string> | null
 }
 
 export declare class TlsAdaptor {
@@ -62,18 +79,9 @@ export declare const enum ExchangeType {
   Headers = 'Headers'
 }
 
-export interface Message {
+export interface MessagePayload {
   body: Buffer
   contentType?: string
-  routingKey?: string
-  exchange?: string
-  redelivered?: boolean
-  deliveryTag?: number
-  correlationId?: string
-  messageId?: string
-  appId?: string
-  timestamp?: number
-  headers?: Record<string, string>
 }
 
 export interface QoSConfig {
