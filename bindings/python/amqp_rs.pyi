@@ -1,8 +1,26 @@
-from typing import Callable, Optional, Awaitable, Union, Sequence, Dict
+from typing import Any, Callable, Optional, Awaitable, Union, Sequence, Dict
 from concurrent.futures import Future
 from enum import Enum
 
 PayloadType = Union[bytes, str, bytearray, "Message"]
+SubscribeHandler = Union[
+    Callable[["Message"], Any],
+    Callable[[bytes], Any],
+    Callable[[memoryview], Any],
+    Callable[[str], Any],
+]
+BatchSubscribeHandler = Union[
+    Callable[[list["Message"]], Any],
+    Callable[[list[bytes]], Any],
+    Callable[[list[memoryview]], Any],
+    Callable[[list[str]], Any],
+]
+RpcHandler = Union[
+    Callable[["Message"], Awaitable[PayloadType]],
+    Callable[[bytes], Awaitable[PayloadType]],
+    Callable[[memoryview], Awaitable[PayloadType]],
+    Callable[[str], Awaitable[PayloadType]],
+]
 
 
 class RequeueError(Exception): ...
@@ -222,6 +240,7 @@ class QoSConfig:
         """
         ...
     
+    @staticmethod
     def default() -> 'QoSConfig':
         ...
     
@@ -235,7 +254,7 @@ class AsyncEventbus:
         config: Config,
         qos_config: QoSConfig,
         batch_config: Optional[Union[bool, BatchConfig]] = None,
-    ) -> None: ...
+    ) -> None:
         """
         Create an AsyncEventbus object thats interacts with Bus
         thats provides some connection management abstractions.
@@ -383,7 +402,7 @@ class AsyncEventbus:
         self,
         exchange_name: str,
         routing_key: str,
-        handler: Callable[[Message], Any],
+        handler: SubscribeHandler,
         process_timeout: Optional[int] = None,
         command_timeout: int = 16,
         batch_dispatch: Optional[bool] = None,
@@ -407,7 +426,7 @@ class AsyncEventbus:
         self,
         exchange_name: str,
         routing_key: str,
-        handler: Callable[[list[Message]], Any],
+        handler: BatchSubscribeHandler,
         batch_size: int = 100,
         max_delay_ms: int = 0,
         process_timeout: Optional[int] = None,
@@ -433,7 +452,7 @@ class AsyncEventbus:
     def provide_resource(
         self,
         routing_key: str,
-        handler: Callable[[bytes], Awaitable[bytes]],
+        handler: RpcHandler,
         process_timeout: Optional[int] = None,
         command_timeout: int = 16,
     ) -> Future[None]:
@@ -470,22 +489,6 @@ class PublishConfirmations(Enum):
     PublisherConfirms = 1
     RPCClientPublisherConfirms = 2
     RPCServerPublisherConfirms = 3
-
-class QueueOptions:
-    auto_delete: bool
-    durable: bool
-    exclusive: bool
-    no_create: bool
-    arguments: dict[str, str]
-
-    def __init__(
-        self,
-        auto_delete: bool,
-        durable: bool,
-        exclusive: bool,
-        no_create: bool,
-        arguments: dict[str, str],
-    ) -> None: ...
 
 class AsyncConnection:
     def __init__(

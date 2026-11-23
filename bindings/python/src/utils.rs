@@ -368,7 +368,7 @@ impl Message {
     }
 
     /// Return a zero-copy memoryview (PEP 3118) of the underlying payload buffer.
-    fn memoryview<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
+    pub(crate) fn memoryview<'py>(slf: Bound<'py, Self>) -> PyResult<Bound<'py, pyo3::types::PyMemoryView>> {
         let py = slf.py();
         unsafe {
             let ptr = pyo3::ffi::PyMemoryView_FromObject(slf.as_ptr());
@@ -852,6 +852,150 @@ impl<'py> Payload<'py> {
         match self {
             Payload::Message(m) => m.get().content_type.clone(),
             _ => None,
+        }
+    }
+}
+
+/// Resolved argument representation expected by a Python subscriber/RPC handler.
+///
+/// Inspected once at registration time (`subscribe`, `subscribe_batch`, `provide_resource`)
+/// so there is zero reflection overhead on the message delivery hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerArgKind {
+    Message,
+    Bytes,
+    MemoryView,
+    Str,
+}
+
+impl HandlerArgKind {
+    fn classify_annotation_str(s: &str) -> Self {
+        match s.trim() {
+            "bytes" | "builtins.bytes" => Self::Bytes,
+            "memoryview" | "builtins.memoryview" => Self::MemoryView,
+            "str" | "builtins.str" => Self::Str,
+            _ => Self::Message,
+        }
+    }
+
+    fn classify_type<'py>(py: Python<'py>, ann: &Bound<'py, PyAny>) -> Self {
+        if let Ok(s) = ann.cast::<PyString>() {
+            return s
+                .to_str()
+                .map(Self::classify_annotation_str)
+                .unwrap_or(Self::Message);
+        }
+        if ann.is(&py.get_type::<PyBytes>()) {
+            Self::Bytes
+        } else if ann.is(&py.get_type::<pyo3::types::PyMemoryView>()) {
+            Self::MemoryView
+        } else if ann.is(&py.get_type::<PyString>()) {
+            Self::Str
+        } else {
+            Self::Message
+        }
+    }
+
+    fn extract_first_param_annotation<'py>(
+        py: Python<'py>,
+        handler: &Bound<'py, PyAny>,
+    ) -> Option<Bound<'py, PyAny>> {
+        let inspect = py.import("inspect").ok()?;
+        let sig = inspect.call_method1("signature", (handler,)).ok()?;
+        let params = sig.getattr("parameters").ok()?;
+        let values = params.call_method0("values").ok()?;
+        let param_cls = inspect.getattr("Parameter").ok()?;
+        let empty = param_cls.getattr("empty").ok()?;
+        let var_positional = param_cls.getattr("VAR_POSITIONAL").ok()?;
+        let var_keyword = param_cls.getattr("VAR_KEYWORD").ok()?;
+
+        let first_param = values.try_iter().ok()?.next()?.ok()?;
+        let kind = first_param.getattr("kind").ok()?;
+        if kind.eq(&var_positional).unwrap_or(false) || kind.eq(&var_keyword).unwrap_or(false) {
+            return None;
+        }
+
+        let ann = first_param.getattr("annotation").ok()?;
+        if ann.is(&empty) {
+            return None;
+        }
+
+        // If annotation is a string (e.g. `from __future__ import annotations`),
+        // try resolving it via `typing.get_type_hints`, falling back to the raw string.
+        if ann.is_instance_of::<PyString>() {
+            if let Ok(param_name) = first_param.getattr("name")
+                && let Ok(typing) = py.import("typing")
+                && let Ok(hints) = typing.call_method1("get_type_hints", (handler,))
+                && let Ok(resolved) = hints.get_item(&param_name)
+            {
+                return Some(resolved);
+            }
+        }
+
+        Some(ann)
+    }
+
+    /// Inspect the first parameter of `handler` to determine whether it expects
+    /// `bytes`, `memoryview`, `str`, or `Message` (default).
+    pub fn detect<'py>(py: Python<'py>, handler: &Bound<'py, PyAny>) -> Self {
+        match Self::extract_first_param_annotation(py, handler) {
+            Some(ann) => Self::classify_type(py, &ann),
+            None => Self::Message,
+        }
+    }
+
+    /// Inspect the first parameter of a batch handler (e.g. `list[bytes]`, `Sequence[str]`)
+    /// to determine the element type. Defaults to `Message`.
+    pub fn detect_batch<'py>(py: Python<'py>, handler: &Bound<'py, PyAny>) -> Self {
+        let Some(ann) = Self::extract_first_param_annotation(py, handler) else {
+            return Self::Message;
+        };
+
+        if let Ok(s) = ann.cast::<PyString>() {
+            if let Ok(raw) = s.to_str()
+                && let Some(inner) = raw
+                    .split_once('[')
+                    .and_then(|(_, rest)| rest.strip_suffix(']'))
+            {
+                return Self::classify_annotation_str(inner);
+            }
+            return Self::Message;
+        }
+
+        if let Ok(typing) = py.import("typing")
+            && let Ok(args) = typing.call_method1("get_args", (&ann,))
+            && let Ok(len) = args.len()
+            && len == 1
+            && let Ok(inner) = args.get_item(0)
+        {
+            return Self::classify_type(py, &inner);
+        }
+
+        Self::Message
+    }
+
+    /// Convert a delivered Rust `RuMessage` into the Python object expected by the handler.
+    #[inline]
+    pub fn into_py_arg<'py>(
+        self,
+        py: Python<'py>,
+        msg: RuMessage,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        match self {
+            Self::Message => Ok(Bound::new(py, Message::from(msg))?.into_any()),
+            Self::Bytes => Ok(PyBytes::new(py, &msg.body).into_any()),
+            Self::MemoryView => {
+                let bound_msg = Bound::new(py, Message::from(msg))?;
+                Ok(Message::memoryview(bound_msg)?.into_any())
+            }
+            Self::Str => {
+                let s = std::str::from_utf8(&msg.body).map_err(|e| {
+                    pyo3::exceptions::PyUnicodeDecodeError::new_utf8(py, &msg.body, e)
+                        .map(PyErr::from)
+                        .unwrap_or_else(PyErr::from)
+                })?;
+                Ok(PyString::new(py, s).into_any())
+            }
         }
     }
 }

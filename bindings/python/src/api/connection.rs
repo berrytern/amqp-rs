@@ -1,7 +1,7 @@
 use crate::{
     exceptions::{AppError, py_err_to_handler_error},
     utils::{
-        Config, ContentEncoding, DeliveryMode, ExchangeOptions, Message, Payload,
+        Config, ContentEncoding, DeliveryMode, ExchangeOptions, HandlerArgKind, Message, Payload,
         PublishConfirmations, QueueOptions, Topology,
     },
 };
@@ -95,6 +95,7 @@ impl AsyncConnection {
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
         let conn = Arc::clone(&slf.inner);
+        let arg_kind = HandlerArgKind::detect(py, handler.bind(py));
         let handler = Arc::new(handler);
         let routing_key = routing_key.to_owned();
         let exchange_name = exchange_name.to_owned();
@@ -110,7 +111,8 @@ impl AsyncConnection {
                 pyo3_async_runtimes::tokio::scope(locals_clone, async move {
                     let future_result = match Python::try_attach(|py| -> PyResult<_> {
                         let bound_handler = handler_clone.bind(py);
-                        let coro = bound_handler.call1((Message::from(body),))?;
+                        let arg = arg_kind.into_py_arg(py, body)?;
+                        let coro = bound_handler.call1((arg,))?;
 
                         match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
                             Ok(fut) => Ok(fut),
@@ -184,6 +186,7 @@ impl AsyncConnection {
         let locals = pyo3_async_runtimes::TaskLocals::with_running_loop(slf.py())?;
         let py = slf.py();
         let conn = Arc::clone(&slf.inner);
+        let arg_kind = HandlerArgKind::detect(py, handler.bind(py));
         let handler = Arc::new(handler);
         let routing_key = routing_key.to_owned();
         let exchange_name = exchange_name.to_owned();
@@ -199,7 +202,8 @@ impl AsyncConnection {
                 pyo3_async_runtimes::tokio::scope(locals_clone, async move {
                     let py_future_result = match Python::try_attach(|py| -> PyResult<_> {
                         let bound_handler = handler_clone.bind(py);
-                        let coro = bound_handler.call1((Message::from(body),))?;
+                        let arg = arg_kind.into_py_arg(py, body)?;
+                        let coro = bound_handler.call1((arg,))?;
 
                         // Now into_future will successfully find the asyncio loop!
                         match pyo3_async_runtimes::tokio::into_future(coro.clone()) {
